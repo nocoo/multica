@@ -751,7 +751,10 @@ func splitGitHubRepository(value string) (owner, repo string, ok bool) {
 		return "", "", false
 	}
 	owner, repo = canonicalGitHubRepository(parts[0], parts[1])
-	return owner, repo, owner != "" && repo != ""
+	if owner == "" || repo == "" {
+		return "", "", false
+	}
+	return owner, repo, true
 }
 
 // canonicalGitHubRepository returns the case-insensitive GitHub repository
