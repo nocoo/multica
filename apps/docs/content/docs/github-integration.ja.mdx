@@ -170,7 +170,7 @@ multica issue pull-requests sync STU-4469 --repo nocoo/pika --number 530 --outpu
 multica issue pull-requests STU-4469 --output json
 ```
 
-このコマンドでは、Multica が短期の installation token を発行するために `GITHUB_APP_ID` と `GITHUB_APP_PRIVATE_KEY` が必要です。PR と Metadata の読み取り専用権限で十分です。再実行すると同じ PR ミラーと紐づけ行を更新し、重複は作成されません。`404` は App installation が対象リポジトリまたは PR にアクセスできないことを示します。**Settings → GitHub** で `pika` を選択して App をインストールまたは更新してください。
+このコマンドでは、Multica が短期の installation token を発行するために `GITHUB_APP_ID` と `GITHUB_APP_PRIVATE_KEY` が必要です。PR と Metadata の読み取り専用権限で十分です。再実行すると同じ PR ミラーと紐づけ行を更新し、重複は作成されません。`404` は、接続済みのすべての App installation が対象リポジトリまたは PR にアクセスできないことを示します。**Settings → GitHub** で `pika` を選択して App をインストールまたは更新してください。
 
 ### 6. curl プローブで検証する
 

@@ -672,8 +672,23 @@ func (h *Handler) SyncGitHubPullRequest(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 
+		state := derivePRState(pullRequest.State, pullRequest.Draft, pullRequest.Merged)
+		preserveExistingTerminalCloseIntent := false
+		existing, err := h.Queries.GetGitHubPullRequest(r.Context(), db.GetGitHubPullRequestParams{
+			WorkspaceID: workspaceUUID,
+			RepoOwner:   owner,
+			RepoName:    repo,
+			PrNumber:    input.Number,
+		})
+		if err == nil {
+			preserveExistingTerminalCloseIntent = isTerminalPRState(existing.State) && isTerminalPRState(state)
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusInternalServerError, "failed to inspect existing pull request")
+			return
+		}
+
 		action := "edited"
-		if pullRequest.Merged || pullRequest.State == "closed" {
+		if isTerminalPRState(state) {
 			// Terminal PRs need to preserve the close-intent semantics of a
 			// real `pull_request.closed` delivery so a historical merge can
 			// safely advance its linked issue when appropriate.
@@ -692,7 +707,9 @@ func (h *Handler) SyncGitHubPullRequest(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusInternalServerError, "failed to prepare pull request sync")
 			return
 		}
-		h.handlePullRequestEvent(r.Context(), payload)
+		h.handlePullRequestEventWithOptions(r.Context(), payload, githubPullRequestProcessOptions{
+			PreserveExistingTerminalCloseIntent: preserveExistingTerminalCloseIntent,
+		})
 
 		mirrored, err := h.Queries.GetGitHubPullRequest(r.Context(), db.GetGitHubPullRequestParams{
 			WorkspaceID: workspaceUUID,
@@ -729,9 +746,16 @@ func splitGitHubRepository(value string) (owner, repo string, ok bool) {
 	if len(parts) != 2 {
 		return "", "", false
 	}
-	owner = strings.TrimSpace(parts[0])
-	repo = strings.TrimSpace(parts[1])
+	owner, repo = canonicalGitHubRepository(parts[0], parts[1])
 	return owner, repo, owner != "" && repo != ""
+}
+
+// canonicalGitHubRepository returns the case-insensitive GitHub repository
+// identity used by every webhook, sync, pending-suite, and PR-link lookup.
+// PostgreSQL text uniqueness is case-sensitive, so persisting a single case
+// prevents a differently cased GitHub path from creating a duplicate mirror.
+func canonicalGitHubRepository(owner, repo string) (string, string) {
+	return strings.ToLower(strings.TrimSpace(owner)), strings.ToLower(strings.TrimSpace(repo))
 }
 
 // fetchGitHubPullRequest loads one current PR snapshot with an installation
@@ -1028,6 +1052,18 @@ type ghPullRequestPayload struct {
 }
 
 func (h *Handler) handlePullRequestEvent(ctx context.Context, body []byte) {
+	h.handlePullRequestEventWithOptions(ctx, body, githubPullRequestProcessOptions{})
+}
+
+type githubPullRequestProcessOptions struct {
+	// PreserveExistingTerminalCloseIntent keeps merge-time close intent for
+	// existing links during a historical sync of a PR that was terminal both
+	// before and after the sync. New links still derive intent from the first
+	// observed historical snapshot.
+	PreserveExistingTerminalCloseIntent bool
+}
+
+func (h *Handler) handlePullRequestEventWithOptions(ctx context.Context, body []byte, options githubPullRequestProcessOptions) {
 	var p ghPullRequestPayload
 	if err := json.Unmarshal(body, &p); err != nil {
 		slog.Warn("github: bad pull_request payload", "err", err)
@@ -1045,14 +1081,19 @@ func (h *Handler) handlePullRequestEvent(ctx context.Context, body []byte) {
 		}
 		return
 	}
+	repoOwner, repoName := canonicalGitHubRepository(p.Repository.Owner.Login, p.Repository.Name)
+	if repoOwner == "" || repoName == "" {
+		slog.Warn("github: pull_request payload missing repository identity", "installation_id", p.Installation.ID)
+		return
+	}
 
 	state := derivePRState(p.PullRequest.State, p.PullRequest.Draft, p.PullRequest.Merged)
 	mergeable, clearMergeable := derivePRMergeableState(p.Action, p.PullRequest.MergeableState, baseRefChanged(p.Changes))
 	pr, err := h.Queries.UpsertGitHubPullRequest(ctx, db.UpsertGitHubPullRequestParams{
 		WorkspaceID:         inst.WorkspaceID,
 		InstallationID:      inst.InstallationID,
-		RepoOwner:           p.Repository.Owner.Login,
-		RepoName:            p.Repository.Name,
+		RepoOwner:           repoOwner,
+		RepoName:            repoName,
 		PrNumber:            p.PullRequest.Number,
 		Title:               p.PullRequest.Title,
 		State:               state,
@@ -1114,7 +1155,7 @@ func (h *Handler) handlePullRequestEvent(ctx context.Context, body []byte) {
 		// editable before its terminal close event. Once GitHub has delivered
 		// a terminal event, later edit/synchronize webhooks must not rewrite
 		// the merge-time close decision.
-		preserveCloseIntent := p.Action != "closed" && (state == "merged" || state == "closed")
+		preserveCloseIntent := options.PreserveExistingTerminalCloseIntent || (p.Action != "closed" && isTerminalPRState(state))
 		prefix := h.getIssuePrefix(ctx, inst.WorkspaceID)
 		// reevalIssues collects each issue whose link row we just touched so
 		// we can re-run the auto-advance gate against the persisted aggregate
@@ -1132,7 +1173,12 @@ func (h *Handler) handlePullRequestEvent(ctx context.Context, body []byte) {
 				continue
 			}
 			_, declared := closingIdents[id]
-			closeIntent := declared && !preserveCloseIntent
+			closeIntent := declared
+			if preserveCloseIntent && !options.PreserveExistingTerminalCloseIntent {
+				// Live terminal follow-up events preserve existing links and
+				// must not use their current text to create new close intent.
+				closeIntent = false
+			}
 			if err := h.Queries.LinkIssueToPullRequest(ctx, db.LinkIssueToPullRequestParams{
 				IssueID:             issue.ID,
 				PullRequestID:       pr.ID,
@@ -1243,6 +1289,11 @@ func (h *Handler) handleCheckSuiteEvent(ctx context.Context, body []byte) {
 		}
 		return
 	}
+	repoOwner, repoName := canonicalGitHubRepository(p.Repository.Owner.Login, p.Repository.Name)
+	if repoOwner == "" || repoName == "" {
+		slog.Warn("github: check_suite payload missing repository identity", "installation_id", p.Installation.ID)
+		return
+	}
 	if len(p.CheckSuite.PullRequests) == 0 {
 		// Forks emit suites whose `pull_requests` array is empty for
 		// the upstream repo. We have no way to attribute the result
@@ -1264,8 +1315,8 @@ func (h *Handler) handleCheckSuiteEvent(ctx context.Context, body []byte) {
 		// ids no longer match).
 		pr, err := h.Queries.GetGitHubPullRequest(ctx, db.GetGitHubPullRequestParams{
 			WorkspaceID: inst.WorkspaceID,
-			RepoOwner:   p.Repository.Owner.Login,
-			RepoName:    p.Repository.Name,
+			RepoOwner:   repoOwner,
+			RepoName:    repoName,
 			PrNumber:    prRef.Number,
 		})
 		if err != nil {
@@ -1280,8 +1331,8 @@ func (h *Handler) handleCheckSuiteEvent(ctx context.Context, body []byte) {
 			if err := h.Queries.UpsertPendingCheckSuite(ctx, db.UpsertPendingCheckSuiteParams{
 				WorkspaceID:    inst.WorkspaceID,
 				InstallationID: p.Installation.ID,
-				RepoOwner:      p.Repository.Owner.Login,
-				RepoName:       p.Repository.Name,
+				RepoOwner:      repoOwner,
+				RepoName:       repoName,
 				PrNumber:       prRef.Number,
 				SuiteID:        p.CheckSuite.ID,
 				HeadSha:        p.CheckSuite.HeadSHA,
@@ -1424,6 +1475,10 @@ func derivePRState(state string, draft, merged bool) string {
 		return "draft"
 	}
 	return "open"
+}
+
+func isTerminalPRState(state string) bool {
+	return state == "merged" || state == "closed"
 }
 
 func parseGHTime(s string) pgtype.Timestamptz {

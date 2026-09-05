@@ -14,7 +14,7 @@ at the bottom before relying on an exact line.
 | `runIssuePullRequests` handler | `server/cmd/multica/cmd_issue.go:540` | `:507` |
 | Calls `GET /api/issues/<id>/pull-requests` | `server/cmd/multica/cmd_issue.go:555` | `:522` |
 | API route registration | `server/cmd/server/router.go:759` | `:480` |
-| Handler `ListPullRequestsForIssue` → `Queries.ListPullRequestsByIssue` | `server/internal/handler/github.go:779,784` | `:466,471` |
+| Handler `ListPullRequestsForIssue` → `Queries.ListPullRequestsByIssue` | `server/internal/handler/github.go:803,808` | `:466,471` |
 | Row → response mapper `issuePullRequestRowToResponse` | `server/internal/handler/github.go:166` | `:149` |
 
 The listing command resolves the issue ref, GETs the endpoint, and (for
@@ -28,16 +28,24 @@ The listing command resolves the issue ref, GETs the endpoint, and (for
 | CLI `pull-requests sync <issue-id>` registration | `server/cmd/multica/cmd_issue.go:112,273,311-313` |
 | CLI resolves the issue then POSTs the current workspace endpoint | `server/cmd/multica/cmd_issue.go:569-603` |
 | Admin-only route registration | `server/cmd/server/router.go:630` |
-| Handler validates input, tries the workspace's installations, and runs the normal PR processor | `server/internal/handler/github.go:622-735` |
+| Handler validates input, tries the workspace's installations, and runs the normal PR processor | `server/internal/handler/github.go:622-742` |
 | App JWT → installation access-token exchange | `server/internal/handler/github.go:508-550` |
-| Current PR GET through the installation token | `server/internal/handler/github.go:737-777` |
+| Current PR GET through the installation token | `server/internal/handler/github.go:761-799` |
 
-Sync reuses `handlePullRequestEvent` (`github.go:1030`) after fetching a current
-PR snapshot. Its normal PR upsert and `LinkIssueToPullRequest` conflict handling
-are therefore the idempotence mechanism; a second sync updates the same rows.
-Sync requires the App ID + private key so the server can exchange the App JWT
-for an installation token. The route is owner/admin-only because it asks GitHub
-for data on behalf of the workspace.
+Sync reuses `handlePullRequestEventWithOptions` (`github.go:1066`) after fetching
+a current PR snapshot. Its normal PR upsert and `LinkIssueToPullRequest` conflict
+handling are therefore the idempotence mechanism; a second sync updates the same
+rows. `canonicalGitHubRepository` (`github.go:753-759`) lowercases repository
+identity for sync, pull-request webhook, and check-suite webhook lookups. Sync
+requires the App ID + private key so the server can exchange the App JWT for an
+installation token. The route is owner/admin-only because it asks GitHub for data
+on behalf of the workspace.
+
+Before sync processes a terminal fetched PR, it checks for an existing terminal
+PR row (`github.go:675-688`). That case passes
+`PreserveExistingTerminalCloseIntent` into the normal processor (`:710-712`):
+existing conflict rows retain their merge-time close intent, while new links use
+the current snapshot (`github.go:1158-1187`).
 
 ## PR response shape
 
@@ -59,7 +67,7 @@ fields the agent can read off each element of `pull_requests`:
 
 There is **no** standalone `draft` or `merged` boolean in the response. The
 PR lifecycle is encoded in the single `state` string by `derivePRState`
-(`server/internal/handler/github.go:1416`):
+(`server/internal/handler/github.go:1467`):
 
 ```
 merged   → if PullRequest.Merged
@@ -69,47 +77,47 @@ open     → otherwise
 ```
 
 `derivePRState` is called when the webhook upserts the row
-(`server/internal/handler/github.go:1049`), so `state` is what the list endpoint
+(`server/internal/handler/github.go:1090`), so `state` is what the list endpoint
 returns. "Is it merged?" = `state == "merged"` (or `merged_at != null`); "is it a
 draft?" = `state == "draft"`. Combine with `checks_conclusion` for CI status.
 
 ## Two distinct webhook paths: link vs close-intent
 
 Both run inside the `pull_request` webhook handler, gated by the workspace
-auto-link flag (`workspaceAutoLinkPRsEnabled`, `github.go:1496`).
+auto-link flag (`workspaceAutoLinkPRsEnabled`, `github.go:1551`).
 
 ### Path 1 — link (title OR body OR branch)
 
-- `extractIdentifiers` regex helper: `server/internal/handler/github.go:1450`
+- `extractIdentifiers` regex helper: `server/internal/handler/github.go:1505`
 - driving regex `identifierRe` (`\b([a-z][a-z0-9]{1,9})-(\d+)\b`, case-insensitive):
-  `server/internal/handler/github.go:803`
-- call site: `server/internal/handler/github.go:1101` —
+  `server/internal/handler/github.go:827`
+- call site: `server/internal/handler/github.go:1142` —
   `extractIdentifiers(p.PullRequest.Title, p.PullRequest.Body, p.PullRequest.Head.Ref)`
 
 Every `PREFIX-NUMBER` mention in **title, body, or branch** resolves to an issue
-in the workspace and writes a link row (`LinkIssueToPullRequest`, `github.go:1136`).
+in the workspace and writes a link row (`LinkIssueToPullRequest`, `github.go:1182`).
 This is what `multica issue pull-requests` later reads back.
 
-Drifted from the prior skill's `github.go:1101` citation, which pointed at the old
+Drifted from the prior skill's `github.go:1142` citation, which pointed at the old
 call-site location for the link logic.
 
 ### Path 2 — close intent (title OR body only, keyword-adjacent)
 
-- `extractClosingIdentifiers` regex helper: `server/internal/handler/github.go:1473`
+- `extractClosingIdentifiers` regex helper: `server/internal/handler/github.go:1528`
 - driving regex `closingIdentifierRe`
   (`\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[:\s]+([a-z][a-z0-9]{1,9})-(\d+)\b`):
-  `server/internal/handler/github.go:814-816`
-- call site: `server/internal/handler/github.go:1110` —
+  `server/internal/handler/github.go:838-840`
+- call site: `server/internal/handler/github.go:1151` —
   `extractClosingIdentifiers(p.PullRequest.Title, p.PullRequest.Body)` (no branch arg)
 
 Only a `PREFIX-NUMBER` immediately after a closing keyword
 (`Closes`/`Fixes`/`Resolves`, optional `:` then whitespace) sets the link row's
 `close_intent` flag — the gate that auto-advances the issue to `done` on merge.
 `Fix MUL-1` closes; `Fix login MUL-1` does not (adjacency). Branch names are
-deliberately excluded (function doc, `github.go:1466-1472`): a branch like
+deliberately excluded (function doc, `github.go:1521-1527`): a branch like
 `mul-1/fix-login` links but must never declare close intent.
 
-Drifted from the prior skill's `github.go:1110` citation.
+Drifted from the prior skill's `github.go:1151` citation.
 
 Net: a bare title prefix (`MUL-2759: ...`) or a branch ref links only;
 `Closes MUL-2759` links **and** records close intent.

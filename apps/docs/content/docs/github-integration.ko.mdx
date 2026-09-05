@@ -169,7 +169,7 @@ multica issue pull-requests sync STU-4469 --repo nocoo/pika --number 530 --outpu
 multica issue pull-requests STU-4469 --output json
 ```
 
-이 명령은 Multica가 단기 installation token을 발급할 수 있도록 `GITHUB_APP_ID`와 `GITHUB_APP_PRIVATE_KEY`가 필요합니다. PR 및 Metadata 읽기 전용 권한이면 충분합니다. 다시 실행해도 같은 PR 미러와 연결 행만 갱신하며 중복을 만들지 않습니다. `404`는 App installation이 해당 저장소 또는 PR에 접근할 수 없다는 뜻입니다. **Settings → GitHub**에서 `pika`를 포함해 App을 설치하거나 업데이트하세요.
+이 명령은 Multica가 단기 installation token을 발급할 수 있도록 `GITHUB_APP_ID`와 `GITHUB_APP_PRIVATE_KEY`가 필요합니다. PR 및 Metadata 읽기 전용 권한이면 충분합니다. 다시 실행해도 같은 PR 미러와 연결 행만 갱신하며 중복을 만들지 않습니다. `404`는 연결된 모든 App installation이 해당 저장소 또는 PR에 접근할 수 없다는 뜻입니다. **Settings → GitHub**에서 `pika`를 포함해 App을 설치하거나 업데이트하세요.
 
 ### 6. curl 프로브로 검증
 

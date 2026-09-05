@@ -123,6 +123,16 @@ can read the requested repository/PR. Update the App installation to include
 that repository, then retry. A repository-level **Settings → Webhooks** list
 does not need a Multica entry: delivery is configured once on the GitHub App.
 
+Repository owner/name identity is canonicalized to lower case for live
+`pull_request` and `check_suite` deliveries as well as sync. This avoids a
+different-cased `owner/repository` argument creating a second PR mirror.
+
+For a first historical observation of a terminal PR, sync derives close intent
+from the fetched title/body. If the same PR was already terminal locally,
+existing issue links retain their recorded merge-time close intent; only a
+newly discovered link uses the current snapshot. Editing a merged PR later and
+re-syncing cannot rewrite existing close intent.
+
 ## Metadata: high-signal keys only
 
 Metadata is durable issue state. Reading metadata is safe. Writing a metadata key

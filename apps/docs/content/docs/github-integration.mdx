@@ -180,9 +180,9 @@ The App needs `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` for this command so
 Multica can mint a short-lived installation token; the PR and Metadata
 read-only repository permissions remain sufficient. Re-running the command
 updates the same mirrored PR and link rows rather than creating duplicates. A
-`404` means the selected App installation cannot access that repository or PR;
-re-open **Settings → GitHub** and install (or update) the App with `pika`
-selected.
+`404` means none of the workspace's connected App installations can access that
+repository or PR; re-open **Settings → GitHub** and install (or update) the App
+with `pika` selected.
 
 ### 6. Verify with a curl probe
 

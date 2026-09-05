@@ -167,7 +167,7 @@ multica issue pull-requests sync STU-4469 --repo nocoo/pika --number 530 --outpu
 multica issue pull-requests STU-4469 --output json
 ```
 
-该命令需要 `GITHUB_APP_ID` 和 `GITHUB_APP_PRIVATE_KEY`，以便 Multica 签发短期 installation token；PR 与 Metadata 的仓库只读权限已足够。重复执行只会更新同一条 PR 镜像和关联记录，不会产生重复。若返回 `404`，表示 App installation 无权访问该仓库或 PR；请回到 **Settings → GitHub**，以包含 `pika` 的仓库范围安装或更新 App。
+该命令需要 `GITHUB_APP_ID` 和 `GITHUB_APP_PRIVATE_KEY`，以便 Multica 签发短期 installation token；PR 与 Metadata 的仓库只读权限已足够。重复执行只会更新同一条 PR 镜像和关联记录，不会产生重复。若返回 `404`，表示所有已连接的 App installation 都无权访问该仓库或 PR；请回到 **Settings → GitHub**，以包含 `pika` 的仓库范围安装或更新 App。
 
 ### 6. 用 curl 自检
 

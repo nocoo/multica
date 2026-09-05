@@ -2280,7 +2280,7 @@ func TestSplitGitHubRepository(t *testing.T) {
 		wantValid      bool
 	}{
 		{value: "nocoo/pika", wantOwner: "nocoo", wantRepository: "pika", wantValid: true},
-		{value: " nocoo / pika ", wantOwner: "nocoo", wantRepository: "pika", wantValid: true},
+		{value: " Nocoo / PiKa ", wantOwner: "nocoo", wantRepository: "pika", wantValid: true},
 		{value: "pika", wantValid: false},
 		{value: "nocoo/pika/extra", wantValid: false},
 		{value: "/pika", wantValid: false},
@@ -2482,11 +2482,10 @@ func TestFetchInstallationAccount_EmptyAccountKeepsPlaceholder(t *testing.T) {
 	}
 }
 
-// TestSyncGitHubPullRequest_ReplaysHistoricalPR proves the admin sync path
-// fetches a current PR snapshot through an installation token and feeds it
-// into the same idempotent processor used by a webhook delivery. A second
-// sync must keep exactly one issue ↔ PR link.
-func TestSyncGitHubPullRequest_ReplaysHistoricalPR(t *testing.T) {
+// TestSyncGitHubPullRequest_CanonicalizesRepositoryAndPreservesCloseIntent
+// proves sync uses one case-insensitive GitHub identity and cannot rewrite
+// close intent recorded on a terminal webhook delivery.
+func TestSyncGitHubPullRequest_CanonicalizesRepositoryAndPreservesCloseIntent(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("handler test fixture not initialized (no DB?)")
 	}
@@ -2508,6 +2507,18 @@ func TestSyncGitHubPullRequest_ReplaysHistoricalPR(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&issue); err != nil {
 		t.Fatalf("decode created issue: %v", err)
 	}
+	w = httptest.NewRecorder()
+	testHandler.CreateIssue(w, newRequest(http.MethodPost, "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":  "Historical close-intent preservation",
+		"status": "in_progress",
+	}))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue with close intent: %d %s", w.Code, w.Body.String())
+	}
+	var issueWithCloseIntent IssueResponse
+	if err := json.NewDecoder(w.Body).Decode(&issueWithCloseIntent); err != nil {
+		t.Fatalf("decode close-intent issue: %v", err)
+	}
 
 	const installationID int64 = 56565656
 	if _, err := testHandler.Queries.CreateGitHubInstallation(ctx, db.CreateGitHubInstallationParams{
@@ -2519,10 +2530,11 @@ func TestSyncGitHubPullRequest_ReplaysHistoricalPR(t *testing.T) {
 		t.Fatalf("CreateGitHubInstallation: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = testPool.Exec(ctx, `DELETE FROM issue_pull_request WHERE issue_id = $1`, issue.ID)
-		_, _ = testPool.Exec(ctx, `DELETE FROM github_pull_request WHERE workspace_id = $1 AND repo_owner = 'acme' AND repo_name = 'widget' AND pr_number = 530`, testWorkspaceID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM issue_pull_request WHERE issue_id IN ($1, $2)`, issue.ID, issueWithCloseIntent.ID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM github_pull_request WHERE workspace_id = $1 AND repo_owner = 'nocoo' AND repo_name = 'pika' AND pr_number = 530`, testWorkspaceID)
 		_, _ = testPool.Exec(ctx, `DELETE FROM github_installation WHERE installation_id = $1`, installationID)
 		_, _ = testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issue.ID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueWithCloseIntent.ID)
 	})
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2535,7 +2547,7 @@ func TestSyncGitHubPullRequest_ReplaysHistoricalPR(t *testing.T) {
 				t.Errorf("access-token authorization = %q, want App JWT", r.Header.Get("Authorization"))
 			}
 			writeJSON(w, http.StatusCreated, map[string]any{"token": "installation-token"})
-		case "/repos/acme/widget/pulls/530":
+		case "/repos/nocoo/pika/pulls/530":
 			if r.Method != http.MethodGet {
 				t.Errorf("pull-request method = %s, want GET", r.Method)
 			}
@@ -2544,9 +2556,9 @@ func TestSyncGitHubPullRequest_ReplaysHistoricalPR(t *testing.T) {
 			}
 			writeJSON(w, http.StatusOK, map[string]any{
 				"number":     530,
-				"html_url":   "https://github.com/acme/widget/pull/530",
-				"title":      issue.Identifier + ": restore historical PR link",
-				"body":       "",
+				"html_url":   "https://github.com/nocoo/pika/pull/530",
+				"title":      issue.Identifier + ": restore historical PR link " + issueWithCloseIntent.Identifier,
+				"body":       "Closes " + issue.Identifier,
 				"state":      "closed",
 				"draft":      false,
 				"merged":     true,
@@ -2566,11 +2578,44 @@ func TestSyncGitHubPullRequest_ReplaysHistoricalPR(t *testing.T) {
 	githubAPIBase = server.URL
 	t.Cleanup(func() { githubAPIBase = previousAPIBase })
 
-	sync := func() GitHubSyncPullRequestResponse {
+	// The existing webhook used mixed casing for the same GitHub repository and
+	// recorded no close intent when it was merged. A later sync with another
+	// casing must update that canonical row, not add another one, and must not
+	// promote the current body text into merge-time intent.
+	historical := ghPullRequest{
+		Number:    530,
+		HTMLURL:   "https://github.com/nocoo/pika/pull/530",
+		Title:     issue.Identifier + ": original merge " + issueWithCloseIntent.Identifier,
+		Body:      "Closes " + issueWithCloseIntent.Identifier,
+		State:     "closed",
+		Merged:    true,
+		MergedAt:  "2026-09-04T00:00:00Z",
+		ClosedAt:  "2026-09-04T00:00:00Z",
+		CreatedAt: "2026-09-03T00:00:00Z",
+		UpdatedAt: "2026-09-04T00:00:00Z",
+	}
+	historical.Head.Ref = "feature/historical"
+	historical.Head.SHA = "head530"
+	historical.User.Login = "octocat"
+	historicalRaw, err := json.Marshal(ghPullRequestPayload{
+		Action:      "closed",
+		PullRequest: historical,
+		Repository: ghRepository{
+			Name:  "PiKa",
+			Owner: ghRepositoryOwner{Login: "NoCoo"},
+		},
+		Installation: ghInstallationReference{ID: installationID},
+	})
+	if err != nil {
+		t.Fatalf("marshal historical webhook payload: %v", err)
+	}
+	testHandler.handlePullRequestEvent(ctx, historicalRaw)
+
+	sync := func(repository string) GitHubSyncPullRequestResponse {
 		t.Helper()
 		recorder := httptest.NewRecorder()
 		request := newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/github/pull-requests/sync", map[string]any{
-			"repository": "acme/widget",
+			"repository": repository,
 			"number":     530,
 		})
 		request = withURLParam(request, "id", testWorkspaceID)
@@ -2585,13 +2630,17 @@ func TestSyncGitHubPullRequest_ReplaysHistoricalPR(t *testing.T) {
 		return response
 	}
 
-	for attempt := 0; attempt < 2; attempt++ {
-		response := sync()
+	for _, repository := range []string{"Nocoo/Pika", "nocoo/pika"} {
+		response := sync(repository)
 		if response.PullRequest.Number != 530 || response.PullRequest.State != "merged" {
 			t.Fatalf("synced pull request = %+v, want number 530 in merged state", response.PullRequest)
 		}
-		if len(response.LinkedIssueIDs) != 1 || response.LinkedIssueIDs[0] != issue.ID {
-			t.Fatalf("linked issue IDs = %v, want [%s]", response.LinkedIssueIDs, issue.ID)
+		linkedIDs := map[string]bool{}
+		for _, linkedIssueID := range response.LinkedIssueIDs {
+			linkedIDs[linkedIssueID] = true
+		}
+		if len(linkedIDs) != 2 || !linkedIDs[issue.ID] || !linkedIDs[issueWithCloseIntent.ID] {
+			t.Fatalf("linked issue IDs = %v, want [%s %s]", response.LinkedIssueIDs, issue.ID, issueWithCloseIntent.ID)
 		}
 	}
 
@@ -2601,6 +2650,186 @@ func TestSyncGitHubPullRequest_ReplaysHistoricalPR(t *testing.T) {
 	}
 	if len(linked) != 1 {
 		t.Fatalf("linked PR count after repeated sync = %d, want 1", len(linked))
+	}
+	var closeIntent bool
+	if err := testPool.QueryRow(ctx, `SELECT close_intent FROM issue_pull_request WHERE issue_id = $1 AND pull_request_id = $2`, issue.ID, linked[0].ID).Scan(&closeIntent); err != nil {
+		t.Fatalf("load close_intent: %v", err)
+	}
+	if closeIntent {
+		t.Fatal("sync rewrote existing terminal close_intent from false to true")
+	}
+	if err := testPool.QueryRow(ctx, `SELECT close_intent FROM issue_pull_request WHERE issue_id = $1 AND pull_request_id = $2`, issueWithCloseIntent.ID, linked[0].ID).Scan(&closeIntent); err != nil {
+		t.Fatalf("load existing true close_intent: %v", err)
+	}
+	if !closeIntent {
+		t.Fatal("sync rewrote existing terminal close_intent from true to false")
+	}
+	updatedIssue, err := testHandler.Queries.GetIssue(ctx, parseUUID(issue.ID))
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if updatedIssue.Status != "in_progress" {
+		t.Fatalf("sync auto-advanced issue from a later close keyword, got status %q", updatedIssue.Status)
+	}
+}
+
+func TestSyncGitHubPullRequest_UsesLaterInstallationAfterNotFound(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("handler test fixture not initialized (no DB?)")
+	}
+	ctx := context.Background()
+	pemBytes, _ := generateTestRSAKeyPEM(t)
+	t.Setenv("GITHUB_APP_ID", "55556")
+	t.Setenv("GITHUB_APP_PRIVATE_KEY", string(pemBytes))
+
+	w := httptest.NewRecorder()
+	testHandler.CreateIssue(w, newRequest(http.MethodPost, "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":  "Sync installation fallback",
+		"status": "in_progress",
+	}))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue: %d %s", w.Code, w.Body.String())
+	}
+	var issue IssueResponse
+	if err := json.NewDecoder(w.Body).Decode(&issue); err != nil {
+		t.Fatalf("decode created issue: %v", err)
+	}
+
+	const firstInstallationID int64 = 57575757
+	const secondInstallationID int64 = 58585858
+	for _, installationID := range []int64{firstInstallationID, secondInstallationID} {
+		if _, err := testHandler.Queries.CreateGitHubInstallation(ctx, db.CreateGitHubInstallationParams{
+			WorkspaceID:    parseUUID(testWorkspaceID),
+			InstallationID: installationID,
+			AccountLogin:   fmt.Sprintf("fallback-%d", installationID),
+			AccountType:    "Organization",
+		}); err != nil {
+			t.Fatalf("CreateGitHubInstallation(%d): %v", installationID, err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(ctx, `DELETE FROM issue_pull_request WHERE issue_id = $1`, issue.ID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM github_pull_request WHERE workspace_id = $1 AND repo_owner = 'nocoo' AND repo_name = 'pika' AND pr_number = 531`, testWorkspaceID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM github_installation WHERE installation_id IN ($1, $2)`, firstInstallationID, secondInstallationID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issue.ID)
+	})
+
+	var attempts []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case fmt.Sprintf("/app/installations/%d/access_tokens", firstInstallationID):
+			attempts = append(attempts, "first-token")
+			writeJSON(w, http.StatusCreated, map[string]any{"token": "first-token"})
+		case fmt.Sprintf("/app/installations/%d/access_tokens", secondInstallationID):
+			attempts = append(attempts, "second-token")
+			writeJSON(w, http.StatusCreated, map[string]any{"token": "second-token"})
+		case "/repos/nocoo/pika/pulls/531":
+			switch r.Header.Get("Authorization") {
+			case "Bearer first-token":
+				attempts = append(attempts, "first-pr")
+				http.NotFound(w, r)
+			case "Bearer second-token":
+				attempts = append(attempts, "second-pr")
+				writeJSON(w, http.StatusOK, map[string]any{
+					"number":     531,
+					"html_url":   "https://github.com/nocoo/pika/pull/531",
+					"title":      issue.Identifier + ": recover installation fallback",
+					"state":      "open",
+					"created_at": "2026-09-04T00:00:00Z",
+					"updated_at": "2026-09-05T00:00:00Z",
+					"head":       map[string]any{"ref": "feature/fallback", "sha": "head531"},
+					"user":       map[string]any{"login": "octocat"},
+				})
+			default:
+				t.Errorf("unexpected authorization %q", r.Header.Get("Authorization"))
+				http.Error(w, "unexpected authorization", http.StatusUnauthorized)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	previousAPIBase := githubAPIBase
+	githubAPIBase = server.URL
+	t.Cleanup(func() { githubAPIBase = previousAPIBase })
+
+	recorder := httptest.NewRecorder()
+	request := newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/github/pull-requests/sync", map[string]any{
+		"repository": "nocoo/pika",
+		"number":     531,
+	})
+	request = withURLParam(request, "id", testWorkspaceID)
+	testHandler.SyncGitHubPullRequest(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("SyncGitHubPullRequest: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if want := []string{"first-token", "first-pr", "second-token", "second-pr"}; !reflect.DeepEqual(attempts, want) {
+		t.Fatalf("GitHub attempts = %v, want %v", attempts, want)
+	}
+	linked, err := testHandler.Queries.ListPullRequestsByIssue(ctx, parseUUID(issue.ID))
+	if err != nil {
+		t.Fatalf("ListPullRequestsByIssue: %v", err)
+	}
+	if len(linked) != 1 || linked[0].PrNumber != 531 {
+		t.Fatalf("linked PRs = %+v, want one #531", linked)
+	}
+}
+
+func TestSyncGitHubPullRequest_ReturnsNotFoundWhenNoInstallationCanAccessPR(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("handler test fixture not initialized (no DB?)")
+	}
+	ctx := context.Background()
+	pemBytes, _ := generateTestRSAKeyPEM(t)
+	t.Setenv("GITHUB_APP_ID", "55557")
+	t.Setenv("GITHUB_APP_PRIVATE_KEY", string(pemBytes))
+
+	const firstInstallationID int64 = 59595959
+	const secondInstallationID int64 = 60606060
+	for _, installationID := range []int64{firstInstallationID, secondInstallationID} {
+		if _, err := testHandler.Queries.CreateGitHubInstallation(ctx, db.CreateGitHubInstallationParams{
+			WorkspaceID:    parseUUID(testWorkspaceID),
+			InstallationID: installationID,
+			AccountLogin:   fmt.Sprintf("not-found-%d", installationID),
+			AccountType:    "Organization",
+		}); err != nil {
+			t.Fatalf("CreateGitHubInstallation(%d): %v", installationID, err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(ctx, `DELETE FROM github_installation WHERE installation_id IN ($1, $2)`, firstInstallationID, secondInstallationID)
+	})
+
+	var pullRequestFetches int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/access_tokens") {
+			writeJSON(w, http.StatusCreated, map[string]any{"token": "not-found-token"})
+			return
+		}
+		if r.URL.Path == "/repos/nocoo/pika/pulls/532" {
+			pullRequestFetches++
+			http.NotFound(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(server.Close)
+	previousAPIBase := githubAPIBase
+	githubAPIBase = server.URL
+	t.Cleanup(func() { githubAPIBase = previousAPIBase })
+
+	recorder := httptest.NewRecorder()
+	request := newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/github/pull-requests/sync", map[string]any{
+		"repository": "nocoo/pika",
+		"number":     532,
+	})
+	request = withURLParam(request, "id", testWorkspaceID)
+	testHandler.SyncGitHubPullRequest(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("SyncGitHubPullRequest: got %d %s, want 404", recorder.Code, recorder.Body.String())
+	}
+	if pullRequestFetches != 2 {
+		t.Fatalf("pull-request fetches = %d, want both installations tried", pullRequestFetches)
 	}
 }
 
