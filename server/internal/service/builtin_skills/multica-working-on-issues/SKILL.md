@@ -100,6 +100,29 @@ a draft?" is `state == "draft"`; CI status is `checks_conclusion`.
 If the command returns no linked PRs after a PR was opened, the link scanner did
 not observe a routable issue key in the PR title/body/branch.
 
+### Re-syncing a historical pull request
+
+If a PR predates the GitHub App webhook installation, an owner or admin can
+fetch its current state through the connected App and feed it through the same
+idempotent mirror + link path used for a live `pull_request` delivery:
+
+```bash
+multica issue pull-requests sync <issue-id> --repo owner/repository --number 123 --output json
+multica issue pull-requests <issue-id> --output json
+```
+
+The `sync` command first resolves the issue as a guard, then calls the
+workspace-scoped admin endpoint. It needs `GITHUB_APP_ID` and
+`GITHUB_APP_PRIVATE_KEY` in addition to the normal App installation: Multica
+uses them to mint a short-lived installation token. The existing Pull requests
+and Metadata read-only repository permissions are sufficient. Retry is safe;
+the normal PR and issue-link upserts prevent duplicate association rows.
+
+A `404` from sync means none of the workspace's connected App installations
+can read the requested repository/PR. Update the App installation to include
+that repository, then retry. A repository-level **Settings → Webhooks** list
+does not need a Multica entry: delivery is configured once on the GitHub App.
+
 ## Metadata: high-signal keys only
 
 Metadata is durable issue state. Reading metadata is safe. Writing a metadata key

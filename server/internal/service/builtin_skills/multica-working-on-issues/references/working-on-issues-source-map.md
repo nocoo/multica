@@ -11,37 +11,55 @@ at the bottom before relying on an exact line.
 | Behavior | File:line | Drifted from |
 |---|---|---|
 | CLI command `pull-requests <id>` (alias `prs`) | `server/cmd/multica/cmd_issue.go:105` | `:104` |
-| `runIssuePullRequests` handler | `server/cmd/multica/cmd_issue.go:507` | new citation |
-| Calls `GET /api/issues/<id>/pull-requests` | `server/cmd/multica/cmd_issue.go:522` | `:522` (unchanged) |
-| API route registration | `server/cmd/server/router.go:480` | `:480` (unchanged) |
-| Handler `ListPullRequestsForIssue` → `Queries.ListPullRequestsByIssue` | `server/internal/handler/github.go:466,471` | `:466` (unchanged) |
-| Row → response mapper `issuePullRequestRowToResponse` | `server/internal/handler/github.go:149` | new citation |
+| `runIssuePullRequests` handler | `server/cmd/multica/cmd_issue.go:540` | `:507` |
+| Calls `GET /api/issues/<id>/pull-requests` | `server/cmd/multica/cmd_issue.go:555` | `:522` |
+| API route registration | `server/cmd/server/router.go:759` | `:480` |
+| Handler `ListPullRequestsForIssue` → `Queries.ListPullRequestsByIssue` | `server/internal/handler/github.go:779,784` | `:466,471` |
+| Row → response mapper `issuePullRequestRowToResponse` | `server/internal/handler/github.go:166` | `:149` |
 
-The CLI resolves the issue ref, GETs the endpoint, and (for `--output json`)
-prints the raw `{"pull_requests": [...]}` body. Only `--output` is accepted; the
-default `table` shows `NUMBER STATE TITLE URL`.
+The listing command resolves the issue ref, GETs the endpoint, and (for
+`--output json`) prints the raw `{"pull_requests": [...]}` body. Its only flag is
+`--output`; the default `table` shows `NUMBER STATE TITLE URL`.
+
+### Re-sync a historical PR
+
+| Behavior | File:line |
+|---|---|
+| CLI `pull-requests sync <issue-id>` registration | `server/cmd/multica/cmd_issue.go:112,273,311-313` |
+| CLI resolves the issue then POSTs the current workspace endpoint | `server/cmd/multica/cmd_issue.go:569-603` |
+| Admin-only route registration | `server/cmd/server/router.go:630` |
+| Handler validates input, tries the workspace's installations, and runs the normal PR processor | `server/internal/handler/github.go:622-735` |
+| App JWT → installation access-token exchange | `server/internal/handler/github.go:508-550` |
+| Current PR GET through the installation token | `server/internal/handler/github.go:737-777` |
+
+Sync reuses `handlePullRequestEvent` (`github.go:1030`) after fetching a current
+PR snapshot. Its normal PR upsert and `LinkIssueToPullRequest` conflict handling
+are therefore the idempotence mechanism; a second sync updates the same rows.
+Sync requires the App ID + private key so the server can exchange the App JWT
+for an installation token. The route is owner/admin-only because it asks GitHub
+for data on behalf of the workspace.
 
 ## PR response shape
 
-`GitHubPullRequestResponse` struct: `server/internal/handler/github.go:51`. JSON
+`GitHubPullRequestResponse` struct: `server/internal/handler/github.go:68`. JSON
 fields the agent can read off each element of `pull_requests`:
 
-- `number` (`json:"number"`, line 56)
-- `html_url` (`json:"html_url"`, line 59)
-- `title` (`json:"title"`, line 57)
-- `state` (`json:"state"`, line 58) — the folded lifecycle enum (see below)
-- `merged_at` (`json:"merged_at"`, line 63), `closed_at` (line 64)
-- `mergeable_state` (`json:"mergeable_state"`, line 70) — mirrors GitHub; UI only
+- `number` (`json:"number"`, line 73)
+- `html_url` (`json:"html_url"`, line 76)
+- `title` (`json:"title"`, line 74)
+- `state` (`json:"state"`, line 75) — the folded lifecycle enum (see below)
+- `merged_at` (`json:"merged_at"`, line 80), `closed_at` (line 81)
+- `mergeable_state` (`json:"mergeable_state"`, line 87) — mirrors GitHub; UI only
   surfaces `clean`/`dirty`, other values round-trip as unknown
-- `checks_conclusion` (`json:"checks_conclusion"`, line 74) — aggregated
+- `checks_conclusion` (`json:"checks_conclusion"`, line 91) — aggregated
   `"passed"`/`"failed"`/`"pending"` or `null` (no observed suite)
-- `checks_passed` / `checks_failed` / `checks_pending` (lines 78-80) — per-suite
-  counts; `aggregateChecksConclusion` (line 183) folds them into
+- `checks_passed` / `checks_failed` / `checks_pending` (lines 95-97) — per-suite
+  counts; `aggregateChecksConclusion` (line 200) folds them into
   `checks_conclusion`
 
 There is **no** standalone `draft` or `merged` boolean in the response. The
 PR lifecycle is encoded in the single `state` string by `derivePRState`
-(`server/internal/handler/github.go:994`):
+(`server/internal/handler/github.go:1416`):
 
 ```
 merged   → if PullRequest.Merged
@@ -51,47 +69,47 @@ open     → otherwise
 ```
 
 `derivePRState` is called when the webhook upserts the row
-(`server/internal/handler/github.go:682`), so `state` is what the list endpoint
+(`server/internal/handler/github.go:1049`), so `state` is what the list endpoint
 returns. "Is it merged?" = `state == "merged"` (or `merged_at != null`); "is it a
 draft?" = `state == "draft"`. Combine with `checks_conclusion` for CI status.
 
 ## Two distinct webhook paths: link vs close-intent
 
 Both run inside the `pull_request` webhook handler, gated by the workspace
-auto-link flag (`workspaceAutoLinkPRsEnabled`, `github.go:1074`).
+auto-link flag (`workspaceAutoLinkPRsEnabled`, `github.go:1496`).
 
 ### Path 1 — link (title OR body OR branch)
 
-- `extractIdentifiers` regex helper: `server/internal/handler/github.go:1028`
+- `extractIdentifiers` regex helper: `server/internal/handler/github.go:1450`
 - driving regex `identifierRe` (`\b([a-z][a-z0-9]{1,9})-(\d+)\b`, case-insensitive):
-  `server/internal/handler/github.go:490`
-- call site: `server/internal/handler/github.go:727` —
+  `server/internal/handler/github.go:803`
+- call site: `server/internal/handler/github.go:1101` —
   `extractIdentifiers(p.PullRequest.Title, p.PullRequest.Body, p.PullRequest.Head.Ref)`
 
 Every `PREFIX-NUMBER` mention in **title, body, or branch** resolves to an issue
-in the workspace and writes a link row (`LinkIssueToPullRequest`, ~`github.go:762`).
+in the workspace and writes a link row (`LinkIssueToPullRequest`, `github.go:1136`).
 This is what `multica issue pull-requests` later reads back.
 
-Drifted from the prior skill's `github.go:727` citation, which pointed at the old
+Drifted from the prior skill's `github.go:1101` citation, which pointed at the old
 call-site location for the link logic.
 
 ### Path 2 — close intent (title OR body only, keyword-adjacent)
 
-- `extractClosingIdentifiers` regex helper: `server/internal/handler/github.go:1051`
+- `extractClosingIdentifiers` regex helper: `server/internal/handler/github.go:1473`
 - driving regex `closingIdentifierRe`
   (`\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[:\s]+([a-z][a-z0-9]{1,9})-(\d+)\b`):
-  `server/internal/handler/github.go:501`
-- call site: `server/internal/handler/github.go:736` —
+  `server/internal/handler/github.go:814-816`
+- call site: `server/internal/handler/github.go:1110` —
   `extractClosingIdentifiers(p.PullRequest.Title, p.PullRequest.Body)` (no branch arg)
 
 Only a `PREFIX-NUMBER` immediately after a closing keyword
 (`Closes`/`Fixes`/`Resolves`, optional `:` then whitespace) sets the link row's
 `close_intent` flag — the gate that auto-advances the issue to `done` on merge.
 `Fix MUL-1` closes; `Fix login MUL-1` does not (adjacency). Branch names are
-deliberately excluded (function doc, `github.go:1044-1050`): a branch like
+deliberately excluded (function doc, `github.go:1466-1472`): a branch like
 `mul-1/fix-login` links but must never declare close intent.
 
-Drifted from the prior skill's `github.go:736` citation.
+Drifted from the prior skill's `github.go:1110` citation.
 
 Net: a bare title prefix (`MUL-2759: ...`) or a branch ref links only;
 `Closes MUL-2759` links **and** records close intent.
@@ -100,10 +118,10 @@ Net: a bare title prefix (`MUL-2759: ...`) or a branch ref links only;
 
 | Behavior | File:line | Drifted from |
 |---|---|---|
-| Create-time: agent-assigned, non-backlog issue enqueues immediately | `server/internal/handler/issue.go:2263-2264` | new citation |
-| `shouldEnqueueAgentTask` returns false for `backlog` (parking lot) | `server/internal/handler/issue.go:2644-2648` | new citation |
-| Backlog → non-backlog (not done/cancelled) enqueues on update | `server/internal/handler/issue.go:2537-2540` | `:2523` |
-| Same contract in batch update | `server/internal/handler/issue.go:3021-3024` | new citation |
+| Create-time: agent-assigned, non-backlog issue enqueues immediately | `server/internal/handler/issue.go:2534-2535` | `:2263-2264` |
+| `shouldEnqueueAgentTask` returns false for `backlog` (parking lot) | `server/internal/handler/issue.go:2663-2667` | `:2644-2648` |
+| Backlog → non-backlog (not done/cancelled) enqueues on update | `server/internal/handler/issue.go:2555-2562` | `:2537-2540` |
+| Same contract in batch update | `server/internal/handler/issue.go:3046-3052` | `:3021-3024` |
 | Child → `done` posts a system comment on the parent | `server/internal/handler/issue_child_done.go:51` (`notifyParentOfChildDone`; doc comment at `:15`) | func def `:51` |
 
 Creation with `--status todo` (or any non-backlog status) on an agent-assigned

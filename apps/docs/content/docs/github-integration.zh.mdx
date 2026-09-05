@@ -11,12 +11,12 @@ import { Callout } from "fumadocs-ui/components/callout";
 
 ## 集成做了什么
 
-| 出现位置 | 行为 |
-|---|---|
-| **Settings → GitHub** | 工作区 owner / admin 看到 GitHub 这个 tab，里面有主开关、**Connect GitHub** 按钮，以及功能开关（PR 侧栏、Co-authored-by、auto-link）。点 Connect 会打开 GitHub 的 App 安装页；装好后跳回 GitHub tab。 |
-| **Issue 详情侧栏 → Pull requests** | 列出所有自动关联到该 issue 的 PR，含标题、仓库、状态（`Open` / `Draft` / `Merged` / `Closed`）和作者。点一行跳到 GitHub。 |
-| **Webhook（后台）** | 每次 `pull_request` 事件触发：upsert PR 行 → 扫描里面的 issue 编号 →（重新）建立 link。幂等——重投 delivery 不会产生重复记录。 |
-| **Merge 自动改 status** | PR 转 `merged` 时，所有已关联且状态不是 `Done` / `Cancelled` 的 issue 会被推到 `Done`。时间线里以 source 为 `github_pr_merged` 记录。 |
+| 出现位置                           | 行为                                                                                                                                                                                                  |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Settings → GitHub**              | 工作区 owner / admin 看到 GitHub 这个 tab，里面有主开关、**Connect GitHub** 按钮，以及功能开关（PR 侧栏、Co-authored-by、auto-link）。点 Connect 会打开 GitHub 的 App 安装页；装好后跳回 GitHub tab。 |
+| **Issue 详情侧栏 → Pull requests** | 列出所有自动关联到该 issue 的 PR，含标题、仓库、状态（`Open` / `Draft` / `Merged` / `Closed`）和作者。点一行跳到 GitHub。                                                                             |
+| **Webhook（后台）**                | 每次 `pull_request` 事件触发：upsert PR 行 → 扫描里面的 issue 编号 →（重新）建立 link。幂等——重投 delivery 不会产生重复记录。                                                                         |
+| **Merge 自动改 status**            | PR 转 `merged` 时，所有已关联且状态不是 `Done` / `Cancelled` 的 issue 会被推到 `Done`。时间线里以 source 为 `github_pr_merged` 记录。                                                                 |
 
 只镜像 PR 本身。Commit、没开 PR 的分支、CI 检查状态都**不**入库——集成有意保持窄边界。
 
@@ -35,16 +35,17 @@ Webhook 从三个字段抽取编号，顺序是：**PR head 分支** → **PR �
 
 PR 的 `merged` 字段翻成 `true` 时，逐个评估关联的 issue：
 
-| Issue 当前状态 | 结果 |
-|---|---|
-| `done` | 不变（已经是终态）|
-| `cancelled` | **不变**——cancelled 是用户明确放弃工作的信号，集成不覆盖 |
-| 其他（`todo` / `in_progress` / `in_review` / `blocked` / `backlog`）| 转成 `done` |
+| Issue 当前状态                                                       | 结果                                                     |
+| -------------------------------------------------------------------- | -------------------------------------------------------- |
+| `done`                                                               | 不变（已经是终态）                                       |
+| `cancelled`                                                          | **不变**——cancelled 是用户明确放弃工作的信号，集成不覆盖 |
+| 其他（`todo` / `in_progress` / `in_review` / `blocked` / `backlog`） | 转成 `done`                                              |
 
 PR **关闭但没合并**——只更新 PR 卡片的状态为 `Closed`，issue 状态不变。"关闭但不合并"语义因团队而异，Multica 不替用户做决定。
 
 <Callout type="info">
-状态变更的 actor 是 `system`。订阅了该 issue 的成员会收到 inbox 通知，和成员手动改状态时一致。
+  状态变更的 actor 是 `system`。订阅了该 issue 的成员会收到 inbox
+  通知，和成员手动改状态时一致。
 </Callout>
 
 ## 哪些情况不会自动关联
@@ -84,19 +85,19 @@ Self-Host 需要：建一个 GitHub App、指向你的 server、设两个环境�
 
 按下表填写：
 
-| 字段 | 值 |
-|---|---|
-| **GitHub App name** | 任何能辨识的名字，例如 `Multica` 或 `Multica (staging)` |
-| **Homepage URL** | 你的 Multica 前端，例如 `https://multica.example.com` |
-| **Callback URL** | 留空——本集成不使用 OAuth 用户身份 |
-| **Setup URL** | `https://<api-host>/api/github/setup`。**勾选 "Redirect on update"** |
-| **Webhook → Active** | 启用 |
-| **Webhook URL** | `https://<api-host>/api/webhooks/github` |
-| **Webhook secret** | 生成一个长随机字符串（例如 `openssl rand -hex 32`）。这个值会同样填到 step 2 的 env 里 |
-| **Permissions → Repository → Pull requests** | **Read-only** |
-| **Permissions → Repository → Metadata** | Read-only（必填）|
-| **Subscribe to events** | 勾选 **Pull request** |
-| **Where can this GitHub App be installed?** | 自选。单组织部署建议选 `Only on this account` |
+| 字段                                         | 值                                                                                     |
+| -------------------------------------------- | -------------------------------------------------------------------------------------- |
+| **GitHub App name**                          | 任何能辨识的名字，例如 `Multica` 或 `Multica (staging)`                                |
+| **Homepage URL**                             | 你的 Multica 前端，例如 `https://multica.example.com`                                  |
+| **Callback URL**                             | 留空——本集成不使用 OAuth 用户身份                                                      |
+| **Setup URL**                                | `https://<api-host>/api/github/setup`。**勾选 "Redirect on update"**                   |
+| **Webhook → Active**                         | 启用                                                                                   |
+| **Webhook URL**                              | `https://<api-host>/api/webhooks/github`                                               |
+| **Webhook secret**                           | 生成一个长随机字符串（例如 `openssl rand -hex 32`）。这个值会同样填到 step 2 的 env 里 |
+| **Permissions → Repository → Pull requests** | **Read-only**                                                                          |
+| **Permissions → Repository → Metadata**      | Read-only（必填）                                                                      |
+| **Subscribe to events**                      | 勾选 **Pull request**                                                                  |
+| **Where can this GitHub App be installed?**  | 自选。单组织部署建议选 `Only on this account`                                          |
 
 点 **Create GitHub App** 之后，从详情页记下两件事：
 
@@ -104,7 +105,10 @@ Self-Host 需要：建一个 GitHub App、指向你的 server、设两个环境�
 - 你刚生成的 **webhook secret**（GitHub 之后不会再让你读取这个值——现在就保存好）
 
 <Callout type="warning">
-**Webhook secret ≠ Client secret。** App 设置页里两个字段紧挨着。**Webhook secret** 用于签 `pull_request` payload，这才是 Multica 需要的那个；**Client secret** 是 OAuth 用的，和本集成无关。混淆这两个会得到「每条 webhook 都 `401 invalid signature`」的诡异症状。
+  **Webhook secret ≠ Client secret。** App 设置页里两个字段紧挨着。**Webhook
+  secret** 用于签 `pull_request` payload，这才是 Multica 需要的那个；**Client
+  secret** 是 OAuth 用的，和本集成无关。混淆这两个会得到「每条 webhook 都 `401
+  invalid signature`」的诡异症状。
 </Callout>
 
 ### 2. 配置环境变量
@@ -152,7 +156,20 @@ make migrate-up
 
 之后在任意一个仓库开一个分支 / 标题 / 正文带本工作区 issue 编号的 PR——几秒内对应 issue 的详情页上就能看到 Pull requests 区块。
 
-### 5. 用 curl 自检
+Multica 只需要 GitHub App 的 Webhook URL。仓库 **Settings → Webhooks** 列表为空是正常的，**不要**额外创建仓库级 webhook。请在 App 的 **Advanced** 设置中确认 webhook 已启用、地址为 `https://<api-host>/api/webhooks/github`，并订阅了 **Pull request** 事件。
+
+### 5. 同步历史 PR
+
+owner 或 admin 可通过已安装的 GitHub App 拉取既有 PR，并将其重放到与 webhook 相同、幂等的镜像与自动关联路径：
+
+```bash
+multica issue pull-requests sync STU-4469 --repo nocoo/pika --number 530 --output json
+multica issue pull-requests STU-4469 --output json
+```
+
+该命令需要 `GITHUB_APP_ID` 和 `GITHUB_APP_PRIVATE_KEY`，以便 Multica 签发短期 installation token；PR 与 Metadata 的仓库只读权限已足够。重复执行只会更新同一条 PR 镜像和关联记录，不会产生重复。若返回 `404`，表示 App installation 无权访问该仓库或 PR；请回到 **Settings → GitHub**，以包含 `pika` 的仓库范围安装或更新 App。
+
+### 6. 用 curl 自检
 
 如果 GitHub 的 **Recent Deliveries** 里第一次 PR 事件就报 `401 invalid signature`，说明两边的 secret 不一致。绕过 GitHub 直接测 server 是最快的定位方法：
 
@@ -167,11 +184,11 @@ curl -i -X POST https://<api-host>/api/webhooks/github \
   -d "$BODY"
 ```
 
-| HTTP 状态 | 含义 | 修法 |
-|---|---|---|
-| `200` `{"ok":"pong"}` | server 加载的 secret 和你 `$SECRET` 一致——GitHub 那边的 secret 才是错的 | 编辑 App → Webhook secret 字段**粘相同的值** → **必须点 Save changes**（不点 Save 等于没改）→ Redeliver |
-| `401 invalid signature` | server 加载的 secret **不是**你以为的那个 | 进容器确认 env 实际生效（例如 `kubectl exec` → `echo -n "$GITHUB_WEBHOOK_SECRET" \| wc -c`），重新部署 |
-| `503 github webhooks not configured` | `GITHUB_WEBHOOK_SECRET` 在进程里是空的 | 配上 env，重启 API |
+| HTTP 状态                            | 含义                                                                    | 修法                                                                                                    |
+| ------------------------------------ | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `200` `{"ok":"pong"}`                | server 加载的 secret 和你 `$SECRET` 一致——GitHub 那边的 secret 才是错的 | 编辑 App → Webhook secret 字段**粘相同的值** → **必须点 Save changes**（不点 Save 等于没改）→ Redeliver |
+| `401 invalid signature`              | server 加载的 secret **不是**你以为的那个                               | 进容器确认 env 实际生效（例如 `kubectl exec` → `echo -n "$GITHUB_WEBHOOK_SECRET" \| wc -c`），重新部署  |
+| `503 github webhooks not configured` | `GITHUB_WEBHOOK_SECRET` 在进程里是空的                                  | 配上 env，重启 API                                                                                      |
 
 ## 已知限制
 
