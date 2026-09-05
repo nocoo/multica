@@ -100,6 +100,46 @@ a draft?" is `state == "draft"`; CI status is `checks_conclusion`.
 If the command returns no linked PRs after a PR was opened, the link scanner did
 not observe a routable issue key in the PR title/body/branch.
 
+### Re-syncing a historical pull request
+
+If a PR predates the GitHub App webhook installation, an owner or admin can
+fetch its current state through the connected App and feed it through the same
+idempotent mirror + link path used for a live `pull_request` delivery:
+
+```bash
+multica issue pull-requests sync <issue-id> --repo owner/repository --number 123 --output json
+multica issue pull-requests <issue-id> --output json
+```
+
+The `sync` command first resolves the issue as a guard, then calls the
+workspace-scoped admin endpoint. It needs `GITHUB_APP_ID` and
+`GITHUB_APP_PRIVATE_KEY` in addition to the normal App installation: Multica
+uses them to mint a short-lived installation token. The existing Pull requests
+and Metadata read-only repository permissions are sufficient. Retry is safe;
+the normal PR and issue-link upserts prevent duplicate association rows.
+
+A `404` from sync means none of the workspace's connected App installations
+can read the requested repository/PR. Update the App installation to include
+that repository, then retry. A repository-level **Settings → Webhooks** list
+does not need a Multica entry: delivery is configured once on the GitHub App.
+
+Repository owner/name identity is canonicalized to lower case for live
+`pull_request` and `check_suite` deliveries as well as sync. This avoids a
+different-cased `owner/repository` argument creating a second PR mirror.
+Migration `122_github_repository_identity` folds pre-existing case variants,
+their issue links, CI suites, and pending suites into that same identity. A
+survivor's existing link keeps its `close_intent`; a link found only on a
+discarded variant is retained with `close_intent = false` because its final
+merge-time declaration cannot be proven.
+
+For a first historical observation of a terminal PR, sync derives close intent
+from the fetched title/body. If the PR was already **merged** locally and is
+still merged, existing issue links retain their recorded merge-time close
+intent; only a newly discovered link uses the current snapshot. A prior
+`closed` (unmerged) row becoming `merged` is a new merge event, so sync
+recomputes intent from the final snapshot. Editing an already-merged PR later
+and re-syncing cannot rewrite existing close intent.
+
 ## Metadata: high-signal keys only
 
 Metadata is durable issue state. Reading metadata is safe. Writing a metadata key

@@ -33,6 +33,17 @@ import (
 // real GitHub.
 var githubAPIBase = "https://api.github.com"
 
+var errGitHubAppCredentialsNotConfigured = errors.New("github app credentials are not configured")
+
+type githubAPIError struct {
+	operation  string
+	statusCode int
+}
+
+func (e *githubAPIError) Error() string {
+	return fmt.Sprintf("github %s returned %d", e.operation, e.statusCode)
+}
+
 // ── Response shapes ─────────────────────────────────────────────────────────
 
 // GitHubInstallationResponse is the JSON shape returned by the installation
@@ -494,6 +505,47 @@ func signGitHubAppJWT(now time.Time) (string, error) {
 	return signed, nil
 }
 
+// fetchGitHubInstallationAccessToken exchanges the configured App JWT for a
+// short-lived token scoped to one installed account. GitHub requires this
+// token, rather than the App JWT itself, for repository data such as a PR.
+func fetchGitHubInstallationAccessToken(ctx context.Context, installationID int64) (string, error) {
+	appJWT, err := signGitHubAppJWT(time.Now())
+	if err != nil {
+		return "", err
+	}
+	if appJWT == "" {
+		return "", errGitHubAppCredentialsNotConfigured
+	}
+
+	endpoint := fmt.Sprintf("%s/app/installations/%d/access_tokens", strings.TrimRight(githubAPIBase, "/"), installationID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Authorization", "Bearer "+appJWT)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return "", &githubAPIError{operation: "create installation access token", statusCode: resp.StatusCode}
+	}
+
+	var payload struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(payload.Token) == "" {
+		return "", errors.New("github returned an empty installation access token")
+	}
+	return payload.Token, nil
+}
+
 // ── Listing / disconnect ────────────────────────────────────────────────────
 
 // ListGitHubInstallations returns the workspace's connected GitHub
@@ -553,6 +605,204 @@ func (h *Handler) DeleteGitHubInstallation(w http.ResponseWriter, r *http.Reques
 		"id": id,
 	})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+const maxGitHubSyncPullRequestBodyBytes = 8 << 10
+
+type githubSyncPullRequestRequest struct {
+	Repository string `json:"repository"`
+	Number     int32  `json:"number"`
+}
+
+type GitHubSyncPullRequestResponse struct {
+	PullRequest    GitHubPullRequestResponse `json:"pull_request"`
+	LinkedIssueIDs []string                  `json:"linked_issue_ids"`
+}
+
+// SyncGitHubPullRequest fetches one PR through a workspace's connected GitHub
+// App installation, then replays it through the normal PR webhook processor.
+// The normal upserts make retries safe: they update the mirrored PR and link
+// rows without creating duplicates.
+func (h *Handler) SyncGitHubPullRequest(w http.ResponseWriter, r *http.Request) {
+	workspaceID := chi.URLParam(r, "id")
+	workspaceUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace id")
+	if !ok {
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxGitHubSyncPullRequestBodyBytes)
+	var input githubSyncPullRequestRequest
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid sync pull request payload")
+		return
+	}
+	owner, repo, ok := splitGitHubRepository(input.Repository)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "repository must use owner/repository format")
+		return
+	}
+	if input.Number <= 0 {
+		writeError(w, http.StatusBadRequest, "pull request number must be positive")
+		return
+	}
+
+	installations, err := h.Queries.ListGitHubInstallationsByWorkspace(r.Context(), workspaceUUID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list github installations")
+		return
+	}
+	if len(installations) == 0 {
+		writeError(w, http.StatusConflict, "no GitHub App installation is connected to this workspace")
+		return
+	}
+
+	for _, installation := range installations {
+		pullRequest, err := fetchGitHubPullRequest(r.Context(), installation.InstallationID, owner, repo, input.Number)
+		if err != nil {
+			if errors.Is(err, errGitHubAppCredentialsNotConfigured) {
+				writeError(w, http.StatusServiceUnavailable, "GitHub App authentication is not configured")
+				return
+			}
+			var apiErr *githubAPIError
+			if errors.As(err, &apiErr) && apiErr.statusCode == http.StatusNotFound {
+				continue
+			}
+			slog.Warn("github: fetch pull request for sync failed", "err", err, "installation_id", installation.InstallationID, "repository", input.Repository, "number", input.Number)
+			writeError(w, http.StatusBadGateway, "failed to fetch pull request from GitHub")
+			return
+		}
+
+		state := derivePRState(pullRequest.State, pullRequest.Draft, pullRequest.Merged)
+		preserveExistingMergedCloseIntent := false
+		existing, err := h.Queries.GetGitHubPullRequest(r.Context(), db.GetGitHubPullRequestParams{
+			WorkspaceID: workspaceUUID,
+			RepoOwner:   owner,
+			RepoName:    repo,
+			PrNumber:    input.Number,
+		})
+		if err == nil {
+			// A merged PR cannot be reopened, so its existing link intent is
+			// the durable merge-time fact. A closed-but-unmerged PR can later
+			// reopen and merge; that transition is a new terminal event and
+			// must derive intent from the current merge snapshot.
+			preserveExistingMergedCloseIntent = existing.State == "merged" && state == "merged"
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusInternalServerError, "failed to inspect existing pull request")
+			return
+		}
+
+		action := "edited"
+		if isTerminalPRState(state) {
+			// Terminal PRs need to preserve the close-intent semantics of a
+			// real `pull_request.closed` delivery so a historical merge can
+			// safely advance its linked issue when appropriate.
+			action = "closed"
+		}
+		payload, err := json.Marshal(ghPullRequestPayload{
+			Action:      action,
+			PullRequest: pullRequest,
+			Repository: ghRepository{
+				Name:  repo,
+				Owner: ghRepositoryOwner{Login: owner},
+			},
+			Installation: ghInstallationReference{ID: installation.InstallationID},
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to prepare pull request sync")
+			return
+		}
+		h.handlePullRequestEventWithOptions(r.Context(), payload, githubPullRequestProcessOptions{
+			PreserveExistingMergedCloseIntent: preserveExistingMergedCloseIntent,
+		})
+
+		mirrored, err := h.Queries.GetGitHubPullRequest(r.Context(), db.GetGitHubPullRequestParams{
+			WorkspaceID: workspaceUUID,
+			RepoOwner:   owner,
+			RepoName:    repo,
+			PrNumber:    input.Number,
+		})
+		if err != nil {
+			slog.Warn("github: synced pull request was not mirrored", "err", err, "repository", input.Repository, "number", input.Number)
+			writeError(w, http.StatusBadGateway, "failed to mirror pull request from GitHub")
+			return
+		}
+		linkedIssueIDs, err := h.Queries.ListIssueIDsForPullRequest(r.Context(), mirrored.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to list pull request links")
+			return
+		}
+		links := make([]string, 0, len(linkedIssueIDs))
+		for _, issueID := range linkedIssueIDs {
+			links = append(links, uuidToString(issueID))
+		}
+		writeJSON(w, http.StatusOK, GitHubSyncPullRequestResponse{
+			PullRequest:    githubPullRequestToResponse(mirrored),
+			LinkedIssueIDs: links,
+		})
+		return
+	}
+
+	writeError(w, http.StatusNotFound, "pull request is not accessible through this workspace's GitHub App installation")
+}
+
+func splitGitHubRepository(value string) (owner, repo string, ok bool) {
+	parts := strings.Split(strings.TrimSpace(value), "/")
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	owner, repo = canonicalGitHubRepository(parts[0], parts[1])
+	if owner == "" || repo == "" {
+		return "", "", false
+	}
+	return owner, repo, true
+}
+
+// canonicalGitHubRepository returns the case-insensitive GitHub repository
+// identity used by every webhook, sync, pending-suite, and PR-link lookup.
+// PostgreSQL text uniqueness is case-sensitive, so persisting a single case
+// prevents a differently cased GitHub path from creating a duplicate mirror.
+func canonicalGitHubRepository(owner, repo string) (string, string) {
+	return strings.ToLower(strings.TrimSpace(owner)), strings.ToLower(strings.TrimSpace(repo))
+}
+
+// fetchGitHubPullRequest loads one current PR snapshot with an installation
+// token. Calling this only from the admin-only sync route keeps GitHub API
+// access limited to workspace integration managers.
+func fetchGitHubPullRequest(ctx context.Context, installationID int64, owner, repo string, number int32) (ghPullRequest, error) {
+	token, err := fetchGitHubInstallationAccessToken(ctx, installationID)
+	if err != nil {
+		return ghPullRequest{}, err
+	}
+	endpoint := fmt.Sprintf(
+		"%s/repos/%s/%s/pulls/%d",
+		strings.TrimRight(githubAPIBase, "/"),
+		url.PathEscape(owner),
+		url.PathEscape(repo),
+		number,
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return ghPullRequest{}, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ghPullRequest{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ghPullRequest{}, &githubAPIError{operation: "fetch pull request", statusCode: resp.StatusCode}
+	}
+	var pullRequest ghPullRequest
+	if err := json.NewDecoder(resp.Body).Decode(&pullRequest); err != nil {
+		return ghPullRequest{}, err
+	}
+	if pullRequest.Number != number {
+		return ghPullRequest{}, fmt.Errorf("github returned pull request %d, expected %d", pullRequest.Number, number)
+	}
+	return pullRequest, nil
 }
 
 // ── List PRs for an issue ───────────────────────────────────────────────────
@@ -761,46 +1011,65 @@ func (h *Handler) handleInstallationEvent(ctx context.Context, body []byte) {
 	}
 }
 
+type ghPullRequest struct {
+	Number         int32  `json:"number"`
+	HTMLURL        string `json:"html_url"`
+	Title          string `json:"title"`
+	Body           string `json:"body"`
+	State          string `json:"state"`
+	Draft          bool   `json:"draft"`
+	Merged         bool   `json:"merged"`
+	MergedAt       string `json:"merged_at"`
+	ClosedAt       string `json:"closed_at"`
+	CreatedAt      string `json:"created_at"`
+	UpdatedAt      string `json:"updated_at"`
+	MergeableState string `json:"mergeable_state"`
+	Additions      int32  `json:"additions"`
+	Deletions      int32  `json:"deletions"`
+	ChangedFiles   int32  `json:"changed_files"`
+	Head           struct {
+		Ref string `json:"ref"`
+		SHA string `json:"sha"`
+	} `json:"head"`
+	User struct {
+		Login     string `json:"login"`
+		AvatarURL string `json:"avatar_url"`
+	} `json:"user"`
+}
+
+type ghRepositoryOwner struct {
+	Login string `json:"login"`
+}
+
+type ghRepository struct {
+	Name  string            `json:"name"`
+	Owner ghRepositoryOwner `json:"owner"`
+}
+
+type ghInstallationReference struct {
+	ID int64 `json:"id"`
+}
+
 type ghPullRequestPayload struct {
-	Action      string `json:"action"`
-	PullRequest struct {
-		Number         int32  `json:"number"`
-		HTMLURL        string `json:"html_url"`
-		Title          string `json:"title"`
-		Body           string `json:"body"`
-		State          string `json:"state"`
-		Draft          bool   `json:"draft"`
-		Merged         bool   `json:"merged"`
-		MergedAt       string `json:"merged_at"`
-		ClosedAt       string `json:"closed_at"`
-		CreatedAt      string `json:"created_at"`
-		UpdatedAt      string `json:"updated_at"`
-		MergeableState string `json:"mergeable_state"`
-		Additions      int32  `json:"additions"`
-		Deletions      int32  `json:"deletions"`
-		ChangedFiles   int32  `json:"changed_files"`
-		Head           struct {
-			Ref string `json:"ref"`
-			SHA string `json:"sha"`
-		} `json:"head"`
-		User struct {
-			Login     string `json:"login"`
-			AvatarURL string `json:"avatar_url"`
-		} `json:"user"`
-	} `json:"pull_request"`
-	Changes    *ghPRChanges `json:"changes"`
-	Repository struct {
-		Name  string `json:"name"`
-		Owner struct {
-			Login string `json:"login"`
-		} `json:"owner"`
-	} `json:"repository"`
-	Installation struct {
-		ID int64 `json:"id"`
-	} `json:"installation"`
+	Action       string                  `json:"action"`
+	PullRequest  ghPullRequest           `json:"pull_request"`
+	Changes      *ghPRChanges            `json:"changes"`
+	Repository   ghRepository            `json:"repository"`
+	Installation ghInstallationReference `json:"installation"`
 }
 
 func (h *Handler) handlePullRequestEvent(ctx context.Context, body []byte) {
+	h.handlePullRequestEventWithOptions(ctx, body, githubPullRequestProcessOptions{})
+}
+
+type githubPullRequestProcessOptions struct {
+	// PreserveExistingMergedCloseIntent keeps merge-time close intent for
+	// existing links during a historical sync of a PR that was already merged.
+	// New links still derive intent from the first observed historical snapshot.
+	PreserveExistingMergedCloseIntent bool
+}
+
+func (h *Handler) handlePullRequestEventWithOptions(ctx context.Context, body []byte, options githubPullRequestProcessOptions) {
 	var p ghPullRequestPayload
 	if err := json.Unmarshal(body, &p); err != nil {
 		slog.Warn("github: bad pull_request payload", "err", err)
@@ -818,14 +1087,19 @@ func (h *Handler) handlePullRequestEvent(ctx context.Context, body []byte) {
 		}
 		return
 	}
+	repoOwner, repoName := canonicalGitHubRepository(p.Repository.Owner.Login, p.Repository.Name)
+	if repoOwner == "" || repoName == "" {
+		slog.Warn("github: pull_request payload missing repository identity", "installation_id", p.Installation.ID)
+		return
+	}
 
 	state := derivePRState(p.PullRequest.State, p.PullRequest.Draft, p.PullRequest.Merged)
 	mergeable, clearMergeable := derivePRMergeableState(p.Action, p.PullRequest.MergeableState, baseRefChanged(p.Changes))
 	pr, err := h.Queries.UpsertGitHubPullRequest(ctx, db.UpsertGitHubPullRequestParams{
 		WorkspaceID:         inst.WorkspaceID,
 		InstallationID:      inst.InstallationID,
-		RepoOwner:           p.Repository.Owner.Login,
-		RepoName:            p.Repository.Name,
+		RepoOwner:           repoOwner,
+		RepoName:            repoName,
 		PrNumber:            p.PullRequest.Number,
 		Title:               p.PullRequest.Title,
 		State:               state,
@@ -887,7 +1161,7 @@ func (h *Handler) handlePullRequestEvent(ctx context.Context, body []byte) {
 		// editable before its terminal close event. Once GitHub has delivered
 		// a terminal event, later edit/synchronize webhooks must not rewrite
 		// the merge-time close decision.
-		preserveCloseIntent := p.Action != "closed" && (state == "merged" || state == "closed")
+		preserveCloseIntent := options.PreserveExistingMergedCloseIntent || (p.Action != "closed" && isTerminalPRState(state))
 		prefix := h.getIssuePrefix(ctx, inst.WorkspaceID)
 		// reevalIssues collects each issue whose link row we just touched so
 		// we can re-run the auto-advance gate against the persisted aggregate
@@ -905,7 +1179,12 @@ func (h *Handler) handlePullRequestEvent(ctx context.Context, body []byte) {
 				continue
 			}
 			_, declared := closingIdents[id]
-			closeIntent := declared && !preserveCloseIntent
+			closeIntent := declared
+			if preserveCloseIntent && !options.PreserveExistingMergedCloseIntent {
+				// Live terminal follow-up events preserve existing links and
+				// must not use their current text to create new close intent.
+				closeIntent = false
+			}
 			if err := h.Queries.LinkIssueToPullRequest(ctx, db.LinkIssueToPullRequestParams{
 				IssueID:             issue.ID,
 				PullRequestID:       pr.ID,
@@ -1016,6 +1295,11 @@ func (h *Handler) handleCheckSuiteEvent(ctx context.Context, body []byte) {
 		}
 		return
 	}
+	repoOwner, repoName := canonicalGitHubRepository(p.Repository.Owner.Login, p.Repository.Name)
+	if repoOwner == "" || repoName == "" {
+		slog.Warn("github: check_suite payload missing repository identity", "installation_id", p.Installation.ID)
+		return
+	}
 	if len(p.CheckSuite.PullRequests) == 0 {
 		// Forks emit suites whose `pull_requests` array is empty for
 		// the upstream repo. We have no way to attribute the result
@@ -1037,8 +1321,8 @@ func (h *Handler) handleCheckSuiteEvent(ctx context.Context, body []byte) {
 		// ids no longer match).
 		pr, err := h.Queries.GetGitHubPullRequest(ctx, db.GetGitHubPullRequestParams{
 			WorkspaceID: inst.WorkspaceID,
-			RepoOwner:   p.Repository.Owner.Login,
-			RepoName:    p.Repository.Name,
+			RepoOwner:   repoOwner,
+			RepoName:    repoName,
 			PrNumber:    prRef.Number,
 		})
 		if err != nil {
@@ -1053,8 +1337,8 @@ func (h *Handler) handleCheckSuiteEvent(ctx context.Context, body []byte) {
 			if err := h.Queries.UpsertPendingCheckSuite(ctx, db.UpsertPendingCheckSuiteParams{
 				WorkspaceID:    inst.WorkspaceID,
 				InstallationID: p.Installation.ID,
-				RepoOwner:      p.Repository.Owner.Login,
-				RepoName:       p.Repository.Name,
+				RepoOwner:      repoOwner,
+				RepoName:       repoName,
 				PrNumber:       prRef.Number,
 				SuiteID:        p.CheckSuite.ID,
 				HeadSha:        p.CheckSuite.HeadSHA,
@@ -1197,6 +1481,10 @@ func derivePRState(state string, draft, merged bool) string {
 		return "draft"
 	}
 	return "open"
+}
+
+func isTerminalPRState(state string) bool {
+	return state == "merged" || state == "closed"
 }
 
 func parseGHTime(s string) pgtype.Timestamptz {

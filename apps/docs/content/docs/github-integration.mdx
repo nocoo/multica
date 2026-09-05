@@ -11,12 +11,12 @@ There is no per-issue setup. The whole flow is identifier-driven.
 
 ## What the integration does
 
-| Surface | Behavior |
-|---|---|
-| **Settings → GitHub** | Workspace admins see the GitHub tab with a master toggle, **Connect GitHub** button, and feature switches (PR sidebar, Co-authored-by, auto-link). After install you bounce back to the GitHub tab. |
-| **Issue sidebar → Pull requests** | Every PR auto-linked to this issue, with title, repo, state (`Open` / `Draft` / `Merged` / `Closed`), and author. Click a row to jump to the PR on GitHub. |
-| **Webhook (background)** | On every `pull_request` event, Multica upserts the PR row, scans the PR for issue identifiers, and (re)builds the link rows. Idempotent — replaying a delivery is a no-op. |
-| **Auto-status on merge** | When a PR transitions to `merged`, every linked issue not already `Done` or `Cancelled` is moved to `Done`. The status change is timeline-logged with source `github_pr_merged`. |
+| Surface                           | Behavior                                                                                                                                                                                            |
+| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Settings → GitHub**             | Workspace admins see the GitHub tab with a master toggle, **Connect GitHub** button, and feature switches (PR sidebar, Co-authored-by, auto-link). After install you bounce back to the GitHub tab. |
+| **Issue sidebar → Pull requests** | Every PR auto-linked to this issue, with title, repo, state (`Open` / `Draft` / `Merged` / `Closed`), and author. Click a row to jump to the PR on GitHub.                                          |
+| **Webhook (background)**          | On every `pull_request` event, Multica upserts the PR row, scans the PR for issue identifiers, and (re)builds the link rows. Idempotent — replaying a delivery is a no-op.                          |
+| **Auto-status on merge**          | When a PR transitions to `merged`, every linked issue not already `Done` or `Cancelled` is moved to `Done`. The status change is timeline-logged with source `github_pr_merged`.                    |
 
 Only the PR itself is mirrored. Commits, branch refs without an open PR, and CI check states are **not** modeled. The integration is intentionally narrow.
 
@@ -35,16 +35,18 @@ You can reference **multiple issues** in one PR. `Closes MUL-1, MUL-2` links the
 
 When a PR's `merged` field flips to `true`, every linked issue is evaluated:
 
-| Issue current status | Result |
-|---|---|
-| `done` | No change (already terminal). |
-| `cancelled` | **No change** — cancelled means the user explicitly abandoned the work; the integration does not override that signal. |
-| Anything else (`todo`, `in_progress`, `in_review`, `blocked`, `backlog`) | Moved to `done`. |
+| Issue current status                                                     | Result                                                                                                                 |
+| ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| `done`                                                                   | No change (already terminal).                                                                                          |
+| `cancelled`                                                              | **No change** — cancelled means the user explicitly abandoned the work; the integration does not override that signal. |
+| Anything else (`todo`, `in_progress`, `in_review`, `blocked`, `backlog`) | Moved to `done`.                                                                                                       |
 
 Closing a PR **without** merging it only updates the PR card's state to `Closed`. The linked issues stay where they were — the user is the one who decides what closing-without-merge means.
 
 <Callout type="info">
-The action is attributed to the `system` actor on the timeline. Subscribers of the issue receive an inbox notification for the status change, the same way they would if a human had moved it.
+  The action is attributed to the `system` actor on the timeline. Subscribers of
+  the issue receive an inbox notification for the status change, the same way
+  they would if a human had moved it.
 </Callout>
 
 ## What's not auto-linked
@@ -84,19 +86,19 @@ Go to one of:
 
 Fill in:
 
-| Field | Value |
-|---|---|
-| **GitHub App name** | Anything recognizable, e.g. `Multica` or `Multica (staging)`. |
-| **Homepage URL** | Your Multica frontend, e.g. `https://multica.example.com`. |
-| **Callback URL** | Leave blank — Multica doesn't use OAuth user identity. |
-| **Setup URL** | `https://<api-host>/api/github/setup`. **Check "Redirect on update"**. |
-| **Webhook → Active** | Enabled. |
-| **Webhook URL** | `https://<api-host>/api/webhooks/github`. |
-| **Webhook secret** | Generate a long random string (e.g. `openssl rand -hex 32`). You'll paste the same value into Multica's env in step 2. |
-| **Permissions → Repository → Pull requests** | **Read-only**. |
-| **Permissions → Repository → Metadata** | Read-only (mandatory). |
-| **Subscribe to events** | Tick **Pull request**. |
-| **Where can this GitHub App be installed?** | Your choice. `Only on this account` is fine for single-org setups. |
+| Field                                        | Value                                                                                                                  |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| **GitHub App name**                          | Anything recognizable, e.g. `Multica` or `Multica (staging)`.                                                          |
+| **Homepage URL**                             | Your Multica frontend, e.g. `https://multica.example.com`.                                                             |
+| **Callback URL**                             | Leave blank — Multica doesn't use OAuth user identity.                                                                 |
+| **Setup URL**                                | `https://<api-host>/api/github/setup`. **Check "Redirect on update"**.                                                 |
+| **Webhook → Active**                         | Enabled.                                                                                                               |
+| **Webhook URL**                              | `https://<api-host>/api/webhooks/github`.                                                                              |
+| **Webhook secret**                           | Generate a long random string (e.g. `openssl rand -hex 32`). You'll paste the same value into Multica's env in step 2. |
+| **Permissions → Repository → Pull requests** | **Read-only**.                                                                                                         |
+| **Permissions → Repository → Metadata**      | Read-only (mandatory).                                                                                                 |
+| **Subscribe to events**                      | Tick **Pull request**.                                                                                                 |
+| **Where can this GitHub App be installed?**  | Your choice. `Only on this account` is fine for single-org setups.                                                     |
 
 After **Create GitHub App**, note two things from the App's detail page:
 
@@ -104,7 +106,11 @@ After **Create GitHub App**, note two things from the App's detail page:
 - The **webhook secret** you just generated (you can't read it back from GitHub later — save it now).
 
 <Callout type="warning">
-**Webhook secret ≠ Client secret.** The App settings page has both fields stacked together. The **Webhook secret** is what signs `pull_request` payloads — that's the one Multica needs. The **Client secret** is for OAuth and is not used by this integration. Mixing them up produces a confusing `401 invalid signature` on every webhook delivery.
+  **Webhook secret ≠ Client secret.** The App settings page has both fields
+  stacked together. The **Webhook secret** is what signs `pull_request` payloads
+  — that's the one Multica needs. The **Client secret** is for OAuth and is not
+  used by this integration. Mixing them up produces a confusing `401 invalid
+  signature` on every webhook delivery.
 </Callout>
 
 ### 2. Set environment variables
@@ -153,7 +159,32 @@ In Multica:
 
 After that, open any PR whose branch / title / body contains an issue identifier — within a few seconds the Pull requests block appears on that issue's detail page.
 
-### 5. Verify with a curl probe
+The App's Webhook URL is the only GitHub webhook Multica needs. A repository's
+**Settings → Webhooks** list can therefore be empty; do not add a separate
+repository webhook. In the App's **Advanced** settings, confirm the webhook is
+active, points to `https://<api-host>/api/webhooks/github`, and subscribes to
+the **Pull request** event.
+
+### 5. Re-sync a historical pull request
+
+An owner or admin can fetch an already-created PR through the installed GitHub
+App and replay it through the same idempotent mirror and auto-link path as a
+webhook delivery:
+
+```bash
+multica issue pull-requests sync STU-4469 --repo nocoo/pika --number 530 --output json
+multica issue pull-requests STU-4469 --output json
+```
+
+The App needs `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` for this command so
+Multica can mint a short-lived installation token; the PR and Metadata
+read-only repository permissions remain sufficient. Re-running the command
+updates the same mirrored PR and link rows rather than creating duplicates. A
+`404` means none of the workspace's connected App installations can access that
+repository or PR; re-open **Settings → GitHub** and install (or update) the App
+with `pika` selected.
+
+### 6. Verify with a curl probe
 
 If GitHub's **Recent Deliveries** page reports `401 invalid signature` after install, the two sides have different secrets. The fastest way to find out which side is wrong is to bypass GitHub:
 
@@ -168,11 +199,11 @@ curl -i -X POST https://<api-host>/api/webhooks/github \
   -d "$BODY"
 ```
 
-| HTTP status | Meaning | Fix |
-|---|---|---|
-| `200` `{"ok":"pong"}` | Server's loaded secret matches your `$SECRET`. The mismatch is on GitHub. | Edit the App → Webhook secret → **paste the same value** → **Save changes** (clicking out of the field without Save keeps the old secret). Redeliver. |
-| `401 invalid signature` | Server's loaded secret is **not** what you think it is. | Confirm the env var landed in the running process (e.g. `kubectl exec` → `echo -n "$GITHUB_WEBHOOK_SECRET" | wc -c`). Re-deploy. |
-| `503 github webhooks not configured` | `GITHUB_WEBHOOK_SECRET` is empty in the process. | Set the env var, restart the API. |
+| HTTP status                          | Meaning                                                                   | Fix                                                                                                                                                   |
+| ------------------------------------ | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `200` `{"ok":"pong"}`                | Server's loaded secret matches your `$SECRET`. The mismatch is on GitHub. | Edit the App → Webhook secret → **paste the same value** → **Save changes** (clicking out of the field without Save keeps the old secret). Redeliver. |
+| `401 invalid signature`              | Server's loaded secret is **not** what you think it is.                   | Confirm the env var landed in the running process without printing it (e.g. `kubectl exec` → `test -n "$GITHUB_WEBHOOK_SECRET"`). Re-deploy.          |
+| `503 github webhooks not configured` | `GITHUB_WEBHOOK_SECRET` is empty in the process.                          | Set the env var, restart the API.                                                                                                                     |
 
 ## Limitations
 

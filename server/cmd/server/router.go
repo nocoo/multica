@@ -627,6 +627,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Use(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner", "admin"))
 					r.Get("/github/connect", h.GitHubConnect)
 					r.Delete("/github/installations/{installationId}", h.DeleteGitHubInstallation)
+					r.Post("/github/pull-requests/sync", h.SyncGitHubPullRequest)
 				})
 
 				// Lark integration. Listing is member-visible (same

@@ -11,12 +11,12 @@ import { Callout } from "fumadocs-ui/components/callout";
 
 ## 連携が行うこと
 
-| 場所 | 動作 |
-|---|---|
-| **設定 → GitHub** | ワークスペースの admin には、マスタートグル、**Connect GitHub** ボタン、機能スイッチ（PR サイドバー、Co-authored-by、自動紐づけ）を備えた GitHub タブが表示されます。インストール後は GitHub タブに戻ります。 |
-| **イシューサイドバー → Pull requests** | このイシューに自動で紐づいたすべての PR が、タイトル、リポジトリ、状態（`Open` / `Draft` / `Merged` / `Closed`）、作成者とともに表示されます。行をクリックすると GitHub の該当 PR に移動します。 |
-| **Webhook（バックグラウンド）** | すべての `pull_request` イベントで、Multica は PR 行を upsert し、PR からイシュー識別子をスキャンして、紐づけ行を（再）構築します。冪等性があり、同じ delivery を再送しても変化はありません。 |
-| **マージ時のステータス自動変更** | PR が `merged` に遷移すると、まだ `Done` でも `Cancelled` でもない、紐づいたすべてのイシューが `Done` に移動します。ステータス変更は source `github_pr_merged` でタイムラインに記録されます。 |
+| 場所                                   | 動作                                                                                                                                                                                                          |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **設定 → GitHub**                      | ワークスペースの admin には、マスタートグル、**Connect GitHub** ボタン、機能スイッチ（PR サイドバー、Co-authored-by、自動紐づけ）を備えた GitHub タブが表示されます。インストール後は GitHub タブに戻ります。 |
+| **イシューサイドバー → Pull requests** | このイシューに自動で紐づいたすべての PR が、タイトル、リポジトリ、状態（`Open` / `Draft` / `Merged` / `Closed`）、作成者とともに表示されます。行をクリックすると GitHub の該当 PR に移動します。              |
+| **Webhook（バックグラウンド）**        | すべての `pull_request` イベントで、Multica は PR 行を upsert し、PR からイシュー識別子をスキャンして、紐づけ行を（再）構築します。冪等性があり、同じ delivery を再送しても変化はありません。                 |
+| **マージ時のステータス自動変更**       | PR が `merged` に遷移すると、まだ `Done` でも `Cancelled` でもない、紐づいたすべてのイシューが `Done` に移動します。ステータス変更は source `github_pr_merged` でタイムラインに記録されます。                 |
 
 ミラーリングされるのは PR 自体のみです。コミット、オープンな PR のないブランチ ref、CI チェックの状態はモデル化され**ません**。この連携は意図的に狭く設計されています。
 
@@ -35,16 +35,17 @@ Webhook は次の順序で 3 つのフィールドから識別子を抽出しま
 
 PR の `merged` フィールドが `true` に切り替わると、紐づいたすべてのイシューが評価されます。
 
-| イシューの現在のステータス | 結果 |
-|---|---|
-| `done` | 変化なし（すでに終了状態）。 |
-| `cancelled` | **変化なし** — cancelled はユーザーが作業を明示的に放棄したことを意味するため、連携はこのシグナルを上書きしません。 |
-| それ以外すべて（`todo`、`in_progress`、`in_review`、`blocked`、`backlog`） | `done` に移動。 |
+| イシューの現在のステータス                                                 | 結果                                                                                                                |
+| -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `done`                                                                     | 変化なし（すでに終了状態）。                                                                                        |
+| `cancelled`                                                                | **変化なし** — cancelled はユーザーが作業を明示的に放棄したことを意味するため、連携はこのシグナルを上書きしません。 |
+| それ以外すべて（`todo`、`in_progress`、`in_review`、`blocked`、`backlog`） | `done` に移動。                                                                                                     |
 
 PR をマージ**せずに**クローズした場合は、PR カードの状態が `Closed` に更新されるだけです。紐づいたイシューはそのまま維持されます — マージせずにクローズすることが何を意味するかはユーザーが決めるからです。
 
 <Callout type="info">
-この動作はタイムライン上で `system` アクターに帰属します。イシューの購読者は、人がステータスを移動したときと同じように、ステータス変更に関するインボックス通知を受け取ります。
+  この動作はタイムライン上で `system`
+  アクターに帰属します。イシューの購読者は、人がステータスを移動したときと同じように、ステータス変更に関するインボックス通知を受け取ります。
 </Callout>
 
 ## 自動で紐づかないもの
@@ -84,19 +85,19 @@ Multica Cloud で Multica を実行している場合、連携はすでに構成
 
 次を入力します。
 
-| フィールド | 値 |
-|---|---|
-| **GitHub App name** | 見分けやすい名前、例: `Multica` または `Multica (staging)`。 |
-| **Homepage URL** | Multica フロントエンド、例: `https://multica.example.com`。 |
-| **Callback URL** | 空欄のままにしてください — Multica は OAuth ユーザー ID を使用しません。 |
-| **Setup URL** | `https://<api-host>/api/github/setup`。**「Redirect on update」をチェックしてください。** |
-| **Webhook → Active** | 有効。 |
-| **Webhook URL** | `https://<api-host>/api/webhooks/github`。 |
-| **Webhook secret** | 長いランダム文字列を生成してください（例: `openssl rand -hex 32`）。手順 2 で同じ値を Multica の env に貼り付けます。 |
-| **Permissions → Repository → Pull requests** | **Read-only**。 |
-| **Permissions → Repository → Metadata** | Read-only（必須）。 |
-| **Subscribe to events** | **Pull request** をチェックしてください。 |
-| **Where can this GitHub App be installed?** | お好みで。単一組織のセットアップなら `Only on this account` で十分です。 |
+| フィールド                                   | 値                                                                                                                    |
+| -------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| **GitHub App name**                          | 見分けやすい名前、例: `Multica` または `Multica (staging)`。                                                          |
+| **Homepage URL**                             | Multica フロントエンド、例: `https://multica.example.com`。                                                           |
+| **Callback URL**                             | 空欄のままにしてください — Multica は OAuth ユーザー ID を使用しません。                                              |
+| **Setup URL**                                | `https://<api-host>/api/github/setup`。**「Redirect on update」をチェックしてください。**                             |
+| **Webhook → Active**                         | 有効。                                                                                                                |
+| **Webhook URL**                              | `https://<api-host>/api/webhooks/github`。                                                                            |
+| **Webhook secret**                           | 長いランダム文字列を生成してください（例: `openssl rand -hex 32`）。手順 2 で同じ値を Multica の env に貼り付けます。 |
+| **Permissions → Repository → Pull requests** | **Read-only**。                                                                                                       |
+| **Permissions → Repository → Metadata**      | Read-only（必須）。                                                                                                   |
+| **Subscribe to events**                      | **Pull request** をチェックしてください。                                                                             |
+| **Where can this GitHub App be installed?**  | お好みで。単一組織のセットアップなら `Only on this account` で十分です。                                              |
 
 **Create GitHub App** の後、App の詳細ページから 2 つのことを控えておいてください。
 
@@ -104,7 +105,12 @@ Multica Cloud で Multica を実行している場合、連携はすでに構成
 - 先ほど生成した **webhook secret**（後で GitHub から読み戻すことはできません — 今すぐ保存してください）。
 
 <Callout type="warning">
-**Webhook secret ≠ Client secret。** App 設定ページには両方のフィールドが並んで配置されています。**Webhook secret** は `pull_request` の payload に署名する値で、Multica が必要とするものです。**Client secret** は OAuth 用で、この連携では使用しません。この 2 つを混同すると、すべての webhook delivery で紛らわしい `401 invalid signature` が発生します。
+  **Webhook secret ≠ Client secret。** App
+  設定ページには両方のフィールドが並んで配置されています。**Webhook secret** は
+  `pull_request` の payload に署名する値で、Multica
+  が必要とするものです。**Client secret** は OAuth
+  用で、この連携では使用しません。この 2 つを混同すると、すべての webhook
+  delivery で紛らわしい `401 invalid signature` が発生します。
 </Callout>
 
 ### 2. 環境変数を設定する
@@ -153,7 +159,20 @@ Multica で:
 
 その後、ブランチ / タイトル / 本文にイシュー識別子を含む PR を開いてみてください — 数秒以内に、そのイシューの詳細ページに Pull requests ブロックが表示されます。
 
-### 5. curl プローブで検証する
+Multica に必要なのは GitHub App の Webhook URL だけです。リポジトリの **Settings → Webhooks** が空でも正常なので、リポジトリ単位の webhook を追加しないでください。App の **Advanced** 設定で、webhook が有効、URL が `https://<api-host>/api/webhooks/github`、購読イベントが **Pull request** であることを確認してください。
+
+### 5. 過去の PR を同期する
+
+owner または admin は、インストール済み GitHub App 経由で既存の PR を取得し、webhook delivery と同じ冪等なミラーリングと自動紐づけの経路に再投入できます。
+
+```bash
+multica issue pull-requests sync STU-4469 --repo nocoo/pika --number 530 --output json
+multica issue pull-requests STU-4469 --output json
+```
+
+このコマンドでは、Multica が短期の installation token を発行するために `GITHUB_APP_ID` と `GITHUB_APP_PRIVATE_KEY` が必要です。PR と Metadata の読み取り専用権限で十分です。再実行すると同じ PR ミラーと紐づけ行を更新し、重複は作成されません。`404` は、接続済みのすべての App installation が対象リポジトリまたは PR にアクセスできないことを示します。**Settings → GitHub** で `pika` を選択して App をインストールまたは更新してください。
+
+### 6. curl プローブで検証する
 
 インストール後に GitHub の **Recent Deliveries** ページで `401 invalid signature` が報告される場合、両側の secret が異なっています。どちらが間違っているかを最も速く突き止める方法は、GitHub を迂回することです。
 
@@ -168,11 +187,11 @@ curl -i -X POST https://<api-host>/api/webhooks/github \
   -d "$BODY"
 ```
 
-| HTTP ステータス | 意味 | 解決方法 |
-|---|---|---|
-| `200` `{"ok":"pong"}` | サーバーがロードした secret が `$SECRET` と一致します。不一致は GitHub 側にあります。 | App → Webhook secret を編集 → **同じ値を貼り付け** → **Save changes**（保存せずにフィールドの外をクリックすると古い secret が維持されます）。再送してください。 |
-| `401 invalid signature` | サーバーがロードした secret が思っている値で**ありません**。 | env 変数が実行中のプロセスに反映されたか確認してください（例: `kubectl exec` → `echo -n "$GITHUB_WEBHOOK_SECRET" \| wc -c`）。再デプロイしてください。 |
-| `503 github webhooks not configured` | プロセスで `GITHUB_WEBHOOK_SECRET` が空です。 | env 変数を設定し、API を再起動してください。 |
+| HTTP ステータス                      | 意味                                                                                  | 解決方法                                                                                                                                                        |
+| ------------------------------------ | ------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `200` `{"ok":"pong"}`                | サーバーがロードした secret が `$SECRET` と一致します。不一致は GitHub 側にあります。 | App → Webhook secret を編集 → **同じ値を貼り付け** → **Save changes**（保存せずにフィールドの外をクリックすると古い secret が維持されます）。再送してください。 |
+| `401 invalid signature`              | サーバーがロードした secret が思っている値で**ありません**。                          | env 変数が実行中のプロセスに反映されたか確認してください（例: `kubectl exec` → `echo -n "$GITHUB_WEBHOOK_SECRET" \| wc -c`）。再デプロイしてください。          |
+| `503 github webhooks not configured` | プロセスで `GITHUB_WEBHOOK_SECRET` が空です。                                         | env 変数を設定し、API を再起動してください。                                                                                                                    |
 
 ## 制限事項
 
