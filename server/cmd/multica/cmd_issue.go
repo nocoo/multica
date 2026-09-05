@@ -109,6 +109,13 @@ var issuePullRequestsCmd = &cobra.Command{
 	RunE:    runIssuePullRequests,
 }
 
+var issueSyncPullRequestCmd = &cobra.Command{
+	Use:   "sync <issue-id>",
+	Short: "Fetch a pull request from GitHub and rebuild its issue links",
+	Args:  exactArgs(1),
+	RunE:  runIssueSyncPullRequest,
+}
+
 var issueCreateCmd = &cobra.Command{
 	Use:   "create",
 	Short: "Create a new issue",
@@ -263,6 +270,7 @@ func init() {
 	issueCmd.AddCommand(issueListCmd)
 	issueCmd.AddCommand(issueGetCmd)
 	issueCmd.AddCommand(issuePullRequestsCmd)
+	issuePullRequestsCmd.AddCommand(issueSyncPullRequestCmd)
 	issueCmd.AddCommand(issueCreateCmd)
 	issueCmd.AddCommand(issueUpdateCmd)
 	issueCmd.AddCommand(issueAssignCmd)
@@ -300,6 +308,9 @@ func init() {
 
 	// issue pull-requests
 	issuePullRequestsCmd.Flags().String("output", "table", "Output format: table or json")
+	issueSyncPullRequestCmd.Flags().String("repo", "", "GitHub repository in owner/repository format")
+	issueSyncPullRequestCmd.Flags().Int("number", 0, "GitHub pull request number")
+	issueSyncPullRequestCmd.Flags().String("output", "json", "Output format: table or json")
 
 	// issue create
 	issueCreateCmd.Flags().String("title", "", "Issue title (required)")
@@ -552,6 +563,51 @@ func runIssuePullRequests(cmd *cobra.Command, args []string) error {
 
 	prs, _ := result["pull_requests"].([]any)
 	printIssuePullRequestsTable(normalizePullRequestList(prs))
+	return nil
+}
+
+func runIssueSyncPullRequest(cmd *cobra.Command, args []string) error {
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+	if client.WorkspaceID == "" {
+		if _, err := requireWorkspaceID(cmd); err != nil {
+			return err
+		}
+	}
+
+	ctx, cancel := cli.APIContext(context.Background())
+	defer cancel()
+
+	issueRef, err := resolveIssueRef(ctx, client, args[0])
+	if err != nil {
+		return fmt.Errorf("resolve issue: %w", err)
+	}
+	repository, _ := cmd.Flags().GetString("repo")
+	if strings.TrimSpace(repository) == "" {
+		return fmt.Errorf("--repo is required")
+	}
+	number, _ := cmd.Flags().GetInt("number")
+	if number <= 0 {
+		return fmt.Errorf("--number must be positive")
+	}
+
+	var result map[string]any
+	path := "/api/workspaces/" + url.PathEscape(client.WorkspaceID) + "/github/pull-requests/sync"
+	if err := client.PostJSON(ctx, path, map[string]any{
+		"repository": repository,
+		"number":     number,
+	}, &result); err != nil {
+		return fmt.Errorf("sync pull request for issue %s: %w", issueRef.Display, err)
+	}
+
+	output, _ := cmd.Flags().GetString("output")
+	if output == "json" {
+		return cli.PrintJSON(os.Stdout, result)
+	}
+	pullRequest, _ := result["pull_request"].(map[string]any)
+	printIssuePullRequestsTable(normalizePullRequestList([]any{pullRequest}))
 	return nil
 }
 

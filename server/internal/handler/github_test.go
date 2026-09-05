@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -1966,6 +1967,7 @@ INSERT INTO member (workspace_id, user_id, role) VALUES ($1, $2, $3)
 			r.Use(middleware.RequireWorkspaceRoleFromURL(testHandler.Queries, "id", "owner", "admin"))
 			r.Get("/github/connect", testHandler.GitHubConnect)
 			r.Delete("/github/installations/{installationId}", testHandler.DeleteGitHubInstallation)
+			r.Post("/github/pull-requests/sync", testHandler.SyncGitHubPullRequest)
 		})
 	})
 
@@ -2028,6 +2030,17 @@ INSERT INTO member (workspace_id, user_id, role) VALUES ($1, $2, $3)
 		}
 		if remaining != 0 {
 			t.Errorf("expected installation row gone after admin DELETE, got %d remaining", remaining)
+		}
+	})
+
+	t.Run("POST pull-request sync remains owner/admin only", func(t *testing.T) {
+		if code := exercise(t, http.MethodPost, "/api/workspaces/"+wsID+"/github/pull-requests/sync", memberUserID); code != http.StatusForbidden {
+			t.Errorf("member POST sync: want 403, got %d", code)
+		}
+		// The admin request has an empty body, so reaching the handler is
+		// intentionally a 400 rather than a role failure.
+		if code := exercise(t, http.MethodPost, "/api/workspaces/"+wsID+"/github/pull-requests/sync", adminUserID); code != http.StatusBadRequest {
+			t.Errorf("admin POST sync: want 400 for malformed body, got %d", code)
 		}
 	})
 }
@@ -2250,6 +2263,38 @@ func TestSignGitHubAppJWT_NotConfigured(t *testing.T) {
 	}
 }
 
+func TestFetchGitHubInstallationAccessTokenRequiresAppCredentials(t *testing.T) {
+	t.Setenv("GITHUB_APP_ID", "")
+	t.Setenv("GITHUB_APP_PRIVATE_KEY", "")
+	_, err := fetchGitHubInstallationAccessToken(context.Background(), 123)
+	if !errors.Is(err, errGitHubAppCredentialsNotConfigured) {
+		t.Fatalf("fetchGitHubInstallationAccessToken error = %v, want missing-credentials error", err)
+	}
+}
+
+func TestSplitGitHubRepository(t *testing.T) {
+	cases := []struct {
+		value          string
+		wantOwner      string
+		wantRepository string
+		wantValid      bool
+	}{
+		{value: "nocoo/pika", wantOwner: "nocoo", wantRepository: "pika", wantValid: true},
+		{value: " nocoo / pika ", wantOwner: "nocoo", wantRepository: "pika", wantValid: true},
+		{value: "pika", wantValid: false},
+		{value: "nocoo/pika/extra", wantValid: false},
+		{value: "/pika", wantValid: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.value, func(t *testing.T) {
+			owner, repository, valid := splitGitHubRepository(tc.value)
+			if owner != tc.wantOwner || repository != tc.wantRepository || valid != tc.wantValid {
+				t.Errorf("splitGitHubRepository(%q) = (%q, %q, %v), want (%q, %q, %v)", tc.value, owner, repository, valid, tc.wantOwner, tc.wantRepository, tc.wantValid)
+			}
+		})
+	}
+}
+
 // TestSignGitHubAppJWT_InvalidPEM proves that a malformed private key is
 // surfaced as an error, not silently swallowed. The setup-callback path
 // catches and logs this so the operator gets a breadcrumb instead of an
@@ -2434,6 +2479,128 @@ func TestFetchInstallationAccount_EmptyAccountKeepsPlaceholder(t *testing.T) {
 	}
 	if avatar != nil {
 		t.Errorf("expected nil avatar, got %v", *avatar)
+	}
+}
+
+// TestSyncGitHubPullRequest_ReplaysHistoricalPR proves the admin sync path
+// fetches a current PR snapshot through an installation token and feeds it
+// into the same idempotent processor used by a webhook delivery. A second
+// sync must keep exactly one issue ↔ PR link.
+func TestSyncGitHubPullRequest_ReplaysHistoricalPR(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("handler test fixture not initialized (no DB?)")
+	}
+	ctx := context.Background()
+	pemBytes, _ := generateTestRSAKeyPEM(t)
+	t.Setenv("GITHUB_APP_ID", "55555")
+	t.Setenv("GITHUB_APP_PRIVATE_KEY", string(pemBytes))
+
+	w := httptest.NewRecorder()
+	req := newRequest(http.MethodPost, "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":  "Historical GitHub sync",
+		"status": "in_progress",
+	})
+	testHandler.CreateIssue(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue: %d %s", w.Code, w.Body.String())
+	}
+	var issue IssueResponse
+	if err := json.NewDecoder(w.Body).Decode(&issue); err != nil {
+		t.Fatalf("decode created issue: %v", err)
+	}
+
+	const installationID int64 = 56565656
+	if _, err := testHandler.Queries.CreateGitHubInstallation(ctx, db.CreateGitHubInstallationParams{
+		WorkspaceID:    parseUUID(testWorkspaceID),
+		InstallationID: installationID,
+		AccountLogin:   "sync-test-account",
+		AccountType:    "Organization",
+	}); err != nil {
+		t.Fatalf("CreateGitHubInstallation: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(ctx, `DELETE FROM issue_pull_request WHERE issue_id = $1`, issue.ID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM github_pull_request WHERE workspace_id = $1 AND repo_owner = 'acme' AND repo_name = 'widget' AND pr_number = 530`, testWorkspaceID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM github_installation WHERE installation_id = $1`, installationID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issue.ID)
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case fmt.Sprintf("/app/installations/%d/access_tokens", installationID):
+			if r.Method != http.MethodPost {
+				t.Errorf("access-token method = %s, want POST", r.Method)
+			}
+			if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+				t.Errorf("access-token authorization = %q, want App JWT", r.Header.Get("Authorization"))
+			}
+			writeJSON(w, http.StatusCreated, map[string]any{"token": "installation-token"})
+		case "/repos/acme/widget/pulls/530":
+			if r.Method != http.MethodGet {
+				t.Errorf("pull-request method = %s, want GET", r.Method)
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer installation-token" {
+				t.Errorf("pull-request authorization = %q, want installation token", got)
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"number":     530,
+				"html_url":   "https://github.com/acme/widget/pull/530",
+				"title":      issue.Identifier + ": restore historical PR link",
+				"body":       "",
+				"state":      "closed",
+				"draft":      false,
+				"merged":     true,
+				"merged_at":  "2026-09-05T00:00:00Z",
+				"closed_at":  "2026-09-05T00:00:00Z",
+				"created_at": "2026-09-04T00:00:00Z",
+				"updated_at": "2026-09-05T00:00:00Z",
+				"head":       map[string]any{"ref": "feature/historical", "sha": "head530"},
+				"user":       map[string]any{"login": "octocat", "avatar_url": "https://example.com/octocat.png"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	previousAPIBase := githubAPIBase
+	githubAPIBase = server.URL
+	t.Cleanup(func() { githubAPIBase = previousAPIBase })
+
+	sync := func() GitHubSyncPullRequestResponse {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		request := newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/github/pull-requests/sync", map[string]any{
+			"repository": "acme/widget",
+			"number":     530,
+		})
+		request = withURLParam(request, "id", testWorkspaceID)
+		testHandler.SyncGitHubPullRequest(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("SyncGitHubPullRequest: %d %s", recorder.Code, recorder.Body.String())
+		}
+		var response GitHubSyncPullRequestResponse
+		if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+			t.Fatalf("decode sync response: %v", err)
+		}
+		return response
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		response := sync()
+		if response.PullRequest.Number != 530 || response.PullRequest.State != "merged" {
+			t.Fatalf("synced pull request = %+v, want number 530 in merged state", response.PullRequest)
+		}
+		if len(response.LinkedIssueIDs) != 1 || response.LinkedIssueIDs[0] != issue.ID {
+			t.Fatalf("linked issue IDs = %v, want [%s]", response.LinkedIssueIDs, issue.ID)
+		}
+	}
+
+	linked, err := testHandler.Queries.ListPullRequestsByIssue(ctx, parseUUID(issue.ID))
+	if err != nil {
+		t.Fatalf("ListPullRequestsByIssue: %v", err)
+	}
+	if len(linked) != 1 {
+		t.Fatalf("linked PR count after repeated sync = %d, want 1", len(linked))
 	}
 }
 

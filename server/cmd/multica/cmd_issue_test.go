@@ -373,6 +373,14 @@ func newIssuePullRequestsTestCmd() *cobra.Command {
 	return cmd
 }
 
+func newIssueSyncPullRequestTestCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "sync"}
+	cmd.Flags().String("repo", "", "")
+	cmd.Flags().Int("number", 0, "")
+	cmd.Flags().String("output", "json", "")
+	return cmd
+}
+
 func TestRunIssuePullRequestsListsLinkedPRsAsJSON(t *testing.T) {
 	var gotPaths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -455,6 +463,77 @@ func TestRunIssuePullRequestsTableIncludesCoreFields(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("table output missing %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestRunIssueSyncPullRequestFetchesAndPrintsSyncedPR(t *testing.T) {
+	var gotPaths []string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPaths = append(gotPaths, r.URL.Path)
+		switch r.URL.Path {
+		case "/api/issues/STU-4469":
+			if r.Method != http.MethodGet {
+				t.Errorf("issue lookup method = %s, want GET", r.Method)
+			}
+			json.NewEncoder(w).Encode(map[string]any{
+				"id":         "issue-uuid",
+				"identifier": "STU-4469",
+				"title":      "Historical PR sync",
+			})
+		case "/api/workspaces/workspace-uuid/github/pull-requests/sync":
+			if r.Method != http.MethodPost {
+				t.Errorf("sync method = %s, want POST", r.Method)
+			}
+			if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+				t.Errorf("decode sync body: %v", err)
+			}
+			json.NewEncoder(w).Encode(map[string]any{
+				"pull_request": map[string]any{
+					"number":   530,
+					"state":    "merged",
+					"title":    "STU-4469: restored association",
+					"html_url": "https://github.com/nocoo/pika/pull/530",
+				},
+				"linked_issue_ids": []string{"issue-uuid"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "workspace-uuid")
+	t.Setenv("MULTICA_TOKEN", "test-token")
+
+	cmd := newIssueSyncPullRequestTestCmd()
+	_ = cmd.Flags().Set("repo", "nocoo/pika")
+	_ = cmd.Flags().Set("number", "530")
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	err := runIssueSyncPullRequest(cmd, []string{"STU-4469"})
+	_ = w.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("runIssueSyncPullRequest: %v", err)
+	}
+
+	if want := []string{"/api/issues/STU-4469", "/api/workspaces/workspace-uuid/github/pull-requests/sync"}; fmt.Sprint(gotPaths) != fmt.Sprint(want) {
+		t.Fatalf("paths = %v, want %v", gotPaths, want)
+	}
+	if gotBody["repository"] != "nocoo/pika" || gotBody["number"] != float64(530) {
+		t.Fatalf("sync body = %#v, want repository nocoo/pika and number 530", gotBody)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(out, &response); err != nil {
+		t.Fatalf("decode JSON output: %v\n%s", err, string(out))
+	}
+	pullRequest, _ := response["pull_request"].(map[string]any)
+	if pullRequest["number"] != float64(530) || pullRequest["state"] != "merged" {
+		t.Fatalf("unexpected pull request output: %#v", pullRequest)
 	}
 }
 
