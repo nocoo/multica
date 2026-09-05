@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -2830,6 +2831,358 @@ func TestSyncGitHubPullRequest_ReturnsNotFoundWhenNoInstallationCanAccessPR(t *t
 	}
 	if pullRequestFetches != 2 {
 		t.Fatalf("pull-request fetches = %d, want both installations tried", pullRequestFetches)
+	}
+}
+
+// TestGitHubRepositoryIdentityMigration_ConsolidatesLegacyRowsForSync seeds
+// pre-canonicalization case variants, runs the data migration, then syncs the
+// historical PR through the normal endpoint. This covers the upgrade path,
+// not just new webhook writes.
+func TestGitHubRepositoryIdentityMigration_ConsolidatesLegacyRowsForSync(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("handler test fixture not initialized (no DB?)")
+	}
+	ctx := context.Background()
+	pemBytes, _ := generateTestRSAKeyPEM(t)
+	t.Setenv("GITHUB_APP_ID", "55558")
+	t.Setenv("GITHUB_APP_PRIVATE_KEY", string(pemBytes))
+
+	w := httptest.NewRecorder()
+	testHandler.CreateIssue(w, newRequest(http.MethodPost, "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":  "Legacy repository identity migration",
+		"status": "in_progress",
+	}))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue: %d %s", w.Code, w.Body.String())
+	}
+	var issue IssueResponse
+	if err := json.NewDecoder(w.Body).Decode(&issue); err != nil {
+		t.Fatalf("decode created issue: %v", err)
+	}
+
+	const installationID int64 = 61616161
+	if _, err := testHandler.Queries.CreateGitHubInstallation(ctx, db.CreateGitHubInstallationParams{
+		WorkspaceID:    parseUUID(testWorkspaceID),
+		InstallationID: installationID,
+		AccountLogin:   "migration-test-account",
+		AccountType:    "Organization",
+	}); err != nil {
+		t.Fatalf("CreateGitHubInstallation: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(ctx, `DELETE FROM github_pending_check_suite WHERE workspace_id = $1 AND pr_number = 533`, testWorkspaceID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM issue_pull_request WHERE issue_id = $1`, issue.ID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM github_pull_request WHERE workspace_id = $1 AND pr_number = 533`, testWorkspaceID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM github_installation WHERE installation_id = $1`, installationID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issue.ID)
+	})
+
+	insertPR := func(t *testing.T, owner, repo, state, updatedAt string) string {
+		t.Helper()
+		var id string
+		err := testPool.QueryRow(ctx, `
+INSERT INTO github_pull_request (
+    workspace_id, installation_id, repo_owner, repo_name, pr_number,
+    title, state, html_url, branch, pr_created_at, pr_updated_at, head_sha
+) VALUES ($1, $2, $3, $4, 533, $5, $6, $7, 'legacy/identity', $8, $9, 'head533')
+RETURNING id
+`, testWorkspaceID, installationID, owner, repo, issue.Identifier+": legacy identity", state, "https://github.com/nocoo/pika/pull/533", "2026-09-01T00:00:00Z", updatedAt).Scan(&id)
+		if err != nil {
+			t.Fatalf("insert %s/%s PR: %v", owner, repo, err)
+		}
+		return id
+	}
+	canonicalID := insertPR(t, "nocoo", "pika", "merged", "2026-09-03T00:00:00Z")
+	legacyID := insertPR(t, "NoCoo", "PiKa", "open", "2026-09-02T00:00:00Z")
+
+	if _, err := testPool.Exec(ctx, `
+INSERT INTO issue_pull_request (issue_id, pull_request_id, close_intent)
+VALUES ($1, $2, FALSE), ($1, $3, TRUE)
+`, issue.ID, canonicalID, legacyID); err != nil {
+		t.Fatalf("insert legacy links: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+INSERT INTO github_pull_request_check_suite (pr_id, suite_id, head_sha, app_id, status, updated_at)
+VALUES
+    ($1, 77, 'old-head', 7, 'completed', '2026-09-02T00:00:00Z'),
+    ($2, 77, 'new-head', 7, 'completed', '2026-09-03T00:00:00Z')
+`, canonicalID, legacyID); err != nil {
+		t.Fatalf("insert legacy check suites: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+INSERT INTO github_pending_check_suite (
+    workspace_id, installation_id, repo_owner, repo_name, pr_number,
+    suite_id, head_sha, app_id, status, suite_updated_at, received_at
+) VALUES
+    ($1, $2, 'nocoo', 'pika', 533, 88, 'old-pending-head', 8, 'completed', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z'),
+    ($1, $2, 'NoCoo', 'PiKa', 533, 88, 'new-pending-head', 8, 'completed', '2026-09-03T00:00:00Z', '2026-09-03T00:00:00Z')
+`, testWorkspaceID, installationID); err != nil {
+		t.Fatalf("insert legacy pending check suites: %v", err)
+	}
+
+	migration, err := os.ReadFile("../../migrations/122_github_repository_identity.up.sql")
+	if err != nil {
+		t.Fatalf("read migration: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, string(migration)); err != nil {
+		t.Fatalf("apply repository identity migration: %v", err)
+	}
+
+	var prCount int
+	if err := testPool.QueryRow(ctx, `SELECT COUNT(*) FROM github_pull_request WHERE workspace_id = $1 AND pr_number = 533`, testWorkspaceID).Scan(&prCount); err != nil {
+		t.Fatalf("count migrated PRs: %v", err)
+	}
+	if prCount != 1 {
+		t.Fatalf("migrated PR count = %d, want 1", prCount)
+	}
+	var owner, repo, state string
+	if err := testPool.QueryRow(ctx, `SELECT repo_owner, repo_name, state FROM github_pull_request WHERE id = $1`, canonicalID).Scan(&owner, &repo, &state); err != nil {
+		t.Fatalf("load canonical PR: %v", err)
+	}
+	if owner != "nocoo" || repo != "pika" || state != "merged" {
+		t.Fatalf("canonical PR = %s/%s (%s), want nocoo/pika (merged)", owner, repo, state)
+	}
+	var closeIntent bool
+	if err := testPool.QueryRow(ctx, `SELECT close_intent FROM issue_pull_request WHERE issue_id = $1 AND pull_request_id = $2`, issue.ID, canonicalID).Scan(&closeIntent); err != nil {
+		t.Fatalf("load merged link: %v", err)
+	}
+	if !closeIntent {
+		t.Fatal("migration lost close intent from legacy link")
+	}
+	var suiteHead string
+	if err := testPool.QueryRow(ctx, `SELECT head_sha FROM github_pull_request_check_suite WHERE pr_id = $1 AND suite_id = 77`, canonicalID).Scan(&suiteHead); err != nil {
+		t.Fatalf("load migrated check suite: %v", err)
+	}
+	if suiteHead != "new-head" {
+		t.Fatalf("migrated check-suite head = %q, want newest value", suiteHead)
+	}
+	var pendingHead string
+	if err := testPool.QueryRow(ctx, `SELECT head_sha FROM github_pending_check_suite WHERE workspace_id = $1 AND repo_owner = 'nocoo' AND repo_name = 'pika' AND pr_number = 533 AND suite_id = 88`, testWorkspaceID).Scan(&pendingHead); err != nil {
+		t.Fatalf("load migrated pending check suite: %v", err)
+	}
+	if pendingHead != "new-pending-head" {
+		t.Fatalf("migrated pending-suite head = %q, want newest value", pendingHead)
+	}
+	var pendingCount int
+	if err := testPool.QueryRow(ctx, `SELECT COUNT(*) FROM github_pending_check_suite WHERE workspace_id = $1 AND pr_number = 533 AND suite_id = 88`, testWorkspaceID).Scan(&pendingCount); err != nil {
+		t.Fatalf("count migrated pending check suites: %v", err)
+	}
+	if pendingCount != 1 {
+		t.Fatalf("migrated pending-suite count = %d, want 1", pendingCount)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case fmt.Sprintf("/app/installations/%d/access_tokens", installationID):
+			writeJSON(w, http.StatusCreated, map[string]any{"token": "migration-token"})
+		case "/repos/nocoo/pika/pulls/533":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"number":     533,
+				"html_url":   "https://github.com/nocoo/pika/pull/533",
+				"title":      issue.Identifier + ": sync migrated identity",
+				"state":      "closed",
+				"merged":     true,
+				"merged_at":  "2026-09-04T00:00:00Z",
+				"closed_at":  "2026-09-04T00:00:00Z",
+				"created_at": "2026-09-01T00:00:00Z",
+				"updated_at": "2026-09-04T00:00:00Z",
+				"head":       map[string]any{"ref": "legacy/identity", "sha": "head533"},
+				"user":       map[string]any{"login": "octocat"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	previousAPIBase := githubAPIBase
+	githubAPIBase = server.URL
+	t.Cleanup(func() { githubAPIBase = previousAPIBase })
+
+	recorder := httptest.NewRecorder()
+	request := newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/github/pull-requests/sync", map[string]any{
+		"repository": "NoCoo/PiKa",
+		"number":     533,
+	})
+	request = withURLParam(request, "id", testWorkspaceID)
+	testHandler.SyncGitHubPullRequest(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("SyncGitHubPullRequest after migration: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if err := testPool.QueryRow(ctx, `SELECT COUNT(*) FROM github_pull_request WHERE workspace_id = $1 AND pr_number = 533`, testWorkspaceID).Scan(&prCount); err != nil {
+		t.Fatalf("count synced migrated PRs: %v", err)
+	}
+	if prCount != 1 {
+		t.Fatalf("synced migrated PR count = %d, want 1", prCount)
+	}
+}
+
+func TestSyncGitHubPullRequest_ClosedToMergedRecomputesCloseIntent(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("handler test fixture not initialized (no DB?)")
+	}
+	ctx := context.Background()
+	pemBytes, _ := generateTestRSAKeyPEM(t)
+	t.Setenv("GITHUB_APP_ID", "55559")
+	t.Setenv("GITHUB_APP_PRIVATE_KEY", string(pemBytes))
+
+	createIssue := func(t *testing.T, title string) IssueResponse {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		testHandler.CreateIssue(recorder, newRequest(http.MethodPost, "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+			"title":  title,
+			"status": "in_progress",
+		}))
+		if recorder.Code != http.StatusCreated {
+			t.Fatalf("CreateIssue: %d %s", recorder.Code, recorder.Body.String())
+		}
+		var issue IssueResponse
+		if err := json.NewDecoder(recorder.Body).Decode(&issue); err != nil {
+			t.Fatalf("decode created issue: %v", err)
+		}
+		return issue
+	}
+	removedIntentIssue := createIssue(t, "Closed to merged removes close intent")
+	addedIntentIssue := createIssue(t, "Closed to merged adds close intent")
+
+	const installationID int64 = 62626262
+	if _, err := testHandler.Queries.CreateGitHubInstallation(ctx, db.CreateGitHubInstallationParams{
+		WorkspaceID:    parseUUID(testWorkspaceID),
+		InstallationID: installationID,
+		AccountLogin:   "closed-to-merged-test",
+		AccountType:    "Organization",
+	}); err != nil {
+		t.Fatalf("CreateGitHubInstallation: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(ctx, `DELETE FROM issue_pull_request WHERE issue_id IN ($1, $2)`, removedIntentIssue.ID, addedIntentIssue.ID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM github_pull_request WHERE workspace_id = $1 AND repo_owner = 'nocoo' AND repo_name = 'pika' AND pr_number IN (534, 535)`, testWorkspaceID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM github_installation WHERE installation_id = $1`, installationID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM issue WHERE id IN ($1, $2)`, removedIntentIssue.ID, addedIntentIssue.ID)
+	})
+
+	seedClosedPR := func(t *testing.T, number int32, issue IssueResponse, body string) {
+		t.Helper()
+		pullRequest := ghPullRequest{
+			Number:    number,
+			HTMLURL:   fmt.Sprintf("https://github.com/nocoo/pika/pull/%d", number),
+			Title:     issue.Identifier + ": closed before merge",
+			Body:      body,
+			State:     "closed",
+			ClosedAt:  "2026-09-02T00:00:00Z",
+			CreatedAt: "2026-09-01T00:00:00Z",
+			UpdatedAt: "2026-09-02T00:00:00Z",
+		}
+		pullRequest.Head.Ref = "feature/closed"
+		pullRequest.Head.SHA = fmt.Sprintf("head%d", number)
+		pullRequest.User.Login = "octocat"
+		raw, err := json.Marshal(ghPullRequestPayload{
+			Action:      "closed",
+			PullRequest: pullRequest,
+			Repository: ghRepository{
+				Name:  "pika",
+				Owner: ghRepositoryOwner{Login: "nocoo"},
+			},
+			Installation: ghInstallationReference{ID: installationID},
+		})
+		if err != nil {
+			t.Fatalf("marshal closed PR: %v", err)
+		}
+		testHandler.handlePullRequestEvent(ctx, raw)
+	}
+	seedClosedPR(t, 534, removedIntentIssue, "Closes "+removedIntentIssue.Identifier)
+	seedClosedPR(t, 535, addedIntentIssue, "")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case fmt.Sprintf("/app/installations/%d/access_tokens", installationID):
+			writeJSON(w, http.StatusCreated, map[string]any{"token": "closed-to-merged-token"})
+		case "/repos/nocoo/pika/pulls/534":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"number":     534,
+				"html_url":   "https://github.com/nocoo/pika/pull/534",
+				"title":      removedIntentIssue.Identifier + ": eventually merged",
+				"body":       "",
+				"state":      "closed",
+				"merged":     true,
+				"merged_at":  "2026-09-04T00:00:00Z",
+				"closed_at":  "2026-09-04T00:00:00Z",
+				"created_at": "2026-09-01T00:00:00Z",
+				"updated_at": "2026-09-04T00:00:00Z",
+				"head":       map[string]any{"ref": "feature/closed", "sha": "head534"},
+				"user":       map[string]any{"login": "octocat"},
+			})
+		case "/repos/nocoo/pika/pulls/535":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"number":     535,
+				"html_url":   "https://github.com/nocoo/pika/pull/535",
+				"title":      addedIntentIssue.Identifier + ": eventually merged",
+				"body":       "Closes " + addedIntentIssue.Identifier,
+				"state":      "closed",
+				"merged":     true,
+				"merged_at":  "2026-09-04T00:00:00Z",
+				"closed_at":  "2026-09-04T00:00:00Z",
+				"created_at": "2026-09-01T00:00:00Z",
+				"updated_at": "2026-09-04T00:00:00Z",
+				"head":       map[string]any{"ref": "feature/closed", "sha": "head535"},
+				"user":       map[string]any{"login": "octocat"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	previousAPIBase := githubAPIBase
+	githubAPIBase = server.URL
+	t.Cleanup(func() { githubAPIBase = previousAPIBase })
+
+	sync := func(t *testing.T, number int) {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		request := newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/github/pull-requests/sync", map[string]any{
+			"repository": "nocoo/pika",
+			"number":     number,
+		})
+		request = withURLParam(request, "id", testWorkspaceID)
+		testHandler.SyncGitHubPullRequest(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("SyncGitHubPullRequest(%d): %d %s", number, recorder.Code, recorder.Body.String())
+		}
+	}
+	sync(t, 534)
+	sync(t, 535)
+
+	assertCloseIntent := func(t *testing.T, issueID string, number int32, want bool) {
+		t.Helper()
+		var closeIntent bool
+		err := testPool.QueryRow(ctx, `
+SELECT ipr.close_intent
+FROM issue_pull_request ipr
+JOIN github_pull_request pr ON pr.id = ipr.pull_request_id
+WHERE ipr.issue_id = $1 AND pr.pr_number = $2
+`, issueID, number).Scan(&closeIntent)
+		if err != nil {
+			t.Fatalf("load close intent for #%d: %v", number, err)
+		}
+		if closeIntent != want {
+			t.Fatalf("close intent for #%d = %v, want %v", number, closeIntent, want)
+		}
+	}
+	assertCloseIntent(t, removedIntentIssue.ID, 534, false)
+	assertCloseIntent(t, addedIntentIssue.ID, 535, true)
+
+	removedIssue, err := testHandler.Queries.GetIssue(ctx, parseUUID(removedIntentIssue.ID))
+	if err != nil {
+		t.Fatalf("load removed-intent issue: %v", err)
+	}
+	if removedIssue.Status != "in_progress" {
+		t.Fatalf("removed-intent issue status = %q, want in_progress", removedIssue.Status)
+	}
+	addedIssue, err := testHandler.Queries.GetIssue(ctx, parseUUID(addedIntentIssue.ID))
+	if err != nil {
+		t.Fatalf("load added-intent issue: %v", err)
+	}
+	if addedIssue.Status != "done" {
+		t.Fatalf("added-intent issue status = %q, want done", addedIssue.Status)
 	}
 }
 

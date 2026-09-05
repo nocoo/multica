@@ -673,7 +673,7 @@ func (h *Handler) SyncGitHubPullRequest(w http.ResponseWriter, r *http.Request) 
 		}
 
 		state := derivePRState(pullRequest.State, pullRequest.Draft, pullRequest.Merged)
-		preserveExistingTerminalCloseIntent := false
+		preserveExistingMergedCloseIntent := false
 		existing, err := h.Queries.GetGitHubPullRequest(r.Context(), db.GetGitHubPullRequestParams{
 			WorkspaceID: workspaceUUID,
 			RepoOwner:   owner,
@@ -681,7 +681,11 @@ func (h *Handler) SyncGitHubPullRequest(w http.ResponseWriter, r *http.Request) 
 			PrNumber:    input.Number,
 		})
 		if err == nil {
-			preserveExistingTerminalCloseIntent = isTerminalPRState(existing.State) && isTerminalPRState(state)
+			// A merged PR cannot be reopened, so its existing link intent is
+			// the durable merge-time fact. A closed-but-unmerged PR can later
+			// reopen and merge; that transition is a new terminal event and
+			// must derive intent from the current merge snapshot.
+			preserveExistingMergedCloseIntent = existing.State == "merged" && state == "merged"
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			writeError(w, http.StatusInternalServerError, "failed to inspect existing pull request")
 			return
@@ -708,7 +712,7 @@ func (h *Handler) SyncGitHubPullRequest(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		h.handlePullRequestEventWithOptions(r.Context(), payload, githubPullRequestProcessOptions{
-			PreserveExistingTerminalCloseIntent: preserveExistingTerminalCloseIntent,
+			PreserveExistingMergedCloseIntent: preserveExistingMergedCloseIntent,
 		})
 
 		mirrored, err := h.Queries.GetGitHubPullRequest(r.Context(), db.GetGitHubPullRequestParams{
@@ -1056,11 +1060,10 @@ func (h *Handler) handlePullRequestEvent(ctx context.Context, body []byte) {
 }
 
 type githubPullRequestProcessOptions struct {
-	// PreserveExistingTerminalCloseIntent keeps merge-time close intent for
-	// existing links during a historical sync of a PR that was terminal both
-	// before and after the sync. New links still derive intent from the first
-	// observed historical snapshot.
-	PreserveExistingTerminalCloseIntent bool
+	// PreserveExistingMergedCloseIntent keeps merge-time close intent for
+	// existing links during a historical sync of a PR that was already merged.
+	// New links still derive intent from the first observed historical snapshot.
+	PreserveExistingMergedCloseIntent bool
 }
 
 func (h *Handler) handlePullRequestEventWithOptions(ctx context.Context, body []byte, options githubPullRequestProcessOptions) {
@@ -1155,7 +1158,7 @@ func (h *Handler) handlePullRequestEventWithOptions(ctx context.Context, body []
 		// editable before its terminal close event. Once GitHub has delivered
 		// a terminal event, later edit/synchronize webhooks must not rewrite
 		// the merge-time close decision.
-		preserveCloseIntent := options.PreserveExistingTerminalCloseIntent || (p.Action != "closed" && isTerminalPRState(state))
+		preserveCloseIntent := options.PreserveExistingMergedCloseIntent || (p.Action != "closed" && isTerminalPRState(state))
 		prefix := h.getIssuePrefix(ctx, inst.WorkspaceID)
 		// reevalIssues collects each issue whose link row we just touched so
 		// we can re-run the auto-advance gate against the persisted aggregate
@@ -1174,7 +1177,7 @@ func (h *Handler) handlePullRequestEventWithOptions(ctx context.Context, body []
 			}
 			_, declared := closingIdents[id]
 			closeIntent := declared
-			if preserveCloseIntent && !options.PreserveExistingTerminalCloseIntent {
+			if preserveCloseIntent && !options.PreserveExistingMergedCloseIntent {
 				// Live terminal follow-up events preserve existing links and
 				// must not use their current text to create new close intent.
 				closeIntent = false

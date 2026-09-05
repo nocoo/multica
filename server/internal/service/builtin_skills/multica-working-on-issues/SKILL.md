@@ -126,12 +126,16 @@ does not need a Multica entry: delivery is configured once on the GitHub App.
 Repository owner/name identity is canonicalized to lower case for live
 `pull_request` and `check_suite` deliveries as well as sync. This avoids a
 different-cased `owner/repository` argument creating a second PR mirror.
+Migration `122_github_repository_identity` folds pre-existing case variants,
+their issue links, CI suites, and pending suites into that same identity.
 
 For a first historical observation of a terminal PR, sync derives close intent
-from the fetched title/body. If the same PR was already terminal locally,
-existing issue links retain their recorded merge-time close intent; only a
-newly discovered link uses the current snapshot. Editing a merged PR later and
-re-syncing cannot rewrite existing close intent.
+from the fetched title/body. If the PR was already **merged** locally and is
+still merged, existing issue links retain their recorded merge-time close
+intent; only a newly discovered link uses the current snapshot. A prior
+`closed` (unmerged) row becoming `merged` is a new merge event, so sync
+recomputes intent from the final snapshot. Editing an already-merged PR later
+and re-syncing cannot rewrite existing close intent.
 
 ## Metadata: high-signal keys only
 
