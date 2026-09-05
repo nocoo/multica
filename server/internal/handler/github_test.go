@@ -2859,6 +2859,30 @@ func TestGitHubRepositoryIdentityMigration_ConsolidatesLegacyRowsForSync(t *test
 	if err := json.NewDecoder(w.Body).Decode(&issue); err != nil {
 		t.Fatalf("decode created issue: %v", err)
 	}
+	w = httptest.NewRecorder()
+	testHandler.CreateIssue(w, newRequest(http.MethodPost, "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":  "Migration preserves survivor close intent",
+		"status": "in_progress",
+	}))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue with survivor intent: %d %s", w.Code, w.Body.String())
+	}
+	var survivorTrueIssue IssueResponse
+	if err := json.NewDecoder(w.Body).Decode(&survivorTrueIssue); err != nil {
+		t.Fatalf("decode survivor-intent issue: %v", err)
+	}
+	w = httptest.NewRecorder()
+	testHandler.CreateIssue(w, newRequest(http.MethodPost, "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":  "Migration fails safe without survivor link",
+		"status": "in_progress",
+	}))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue without survivor link: %d %s", w.Code, w.Body.String())
+	}
+	var legacyOnlyIssue IssueResponse
+	if err := json.NewDecoder(w.Body).Decode(&legacyOnlyIssue); err != nil {
+		t.Fatalf("decode legacy-only issue: %v", err)
+	}
 
 	const installationID int64 = 61616161
 	if _, err := testHandler.Queries.CreateGitHubInstallation(ctx, db.CreateGitHubInstallationParams{
@@ -2871,10 +2895,12 @@ func TestGitHubRepositoryIdentityMigration_ConsolidatesLegacyRowsForSync(t *test
 	}
 	t.Cleanup(func() {
 		_, _ = testPool.Exec(ctx, `DELETE FROM github_pending_check_suite WHERE workspace_id = $1 AND pr_number = 533`, testWorkspaceID)
-		_, _ = testPool.Exec(ctx, `DELETE FROM issue_pull_request WHERE issue_id = $1`, issue.ID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM issue_pull_request WHERE issue_id IN ($1, $2, $3)`, issue.ID, survivorTrueIssue.ID, legacyOnlyIssue.ID)
 		_, _ = testPool.Exec(ctx, `DELETE FROM github_pull_request WHERE workspace_id = $1 AND pr_number = 533`, testWorkspaceID)
 		_, _ = testPool.Exec(ctx, `DELETE FROM github_installation WHERE installation_id = $1`, installationID)
 		_, _ = testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issue.ID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, survivorTrueIssue.ID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, legacyOnlyIssue.ID)
 	})
 
 	insertPR := func(t *testing.T, owner, repo, state, updatedAt string) string {
@@ -2897,8 +2923,11 @@ RETURNING id
 
 	if _, err := testPool.Exec(ctx, `
 INSERT INTO issue_pull_request (issue_id, pull_request_id, close_intent)
-VALUES ($1, $2, FALSE), ($1, $3, TRUE)
-`, issue.ID, canonicalID, legacyID); err != nil {
+VALUES
+    ($1, $4, FALSE), ($1, $5, TRUE),
+    ($2, $4, TRUE), ($2, $5, FALSE),
+    ($3, $5, TRUE)
+`, issue.ID, survivorTrueIssue.ID, legacyOnlyIssue.ID, canonicalID, legacyID); err != nil {
 		t.Fatalf("insert legacy links: %v", err)
 	}
 	if _, err := testPool.Exec(ctx, `
@@ -2946,8 +2975,20 @@ INSERT INTO github_pending_check_suite (
 	if err := testPool.QueryRow(ctx, `SELECT close_intent FROM issue_pull_request WHERE issue_id = $1 AND pull_request_id = $2`, issue.ID, canonicalID).Scan(&closeIntent); err != nil {
 		t.Fatalf("load merged link: %v", err)
 	}
+	if closeIntent {
+		t.Fatal("migration restored close intent from an older non-survivor link")
+	}
+	if err := testPool.QueryRow(ctx, `SELECT close_intent FROM issue_pull_request WHERE issue_id = $1 AND pull_request_id = $2`, survivorTrueIssue.ID, canonicalID).Scan(&closeIntent); err != nil {
+		t.Fatalf("load survivor close-intent link: %v", err)
+	}
 	if !closeIntent {
-		t.Fatal("migration lost close intent from legacy link")
+		t.Fatal("migration did not preserve close intent from the survivor link")
+	}
+	if err := testPool.QueryRow(ctx, `SELECT close_intent FROM issue_pull_request WHERE issue_id = $1 AND pull_request_id = $2`, legacyOnlyIssue.ID, canonicalID).Scan(&closeIntent); err != nil {
+		t.Fatalf("load legacy-only close-intent link: %v", err)
+	}
+	if closeIntent {
+		t.Fatal("migration inferred close intent when only a discarded link carried it")
 	}
 	var suiteHead string
 	if err := testPool.QueryRow(ctx, `SELECT head_sha FROM github_pull_request_check_suite WHERE pr_id = $1 AND suite_id = 77`, canonicalID).Scan(&suiteHead); err != nil {
@@ -3013,6 +3054,13 @@ INSERT INTO github_pending_check_suite (
 	}
 	if prCount != 1 {
 		t.Fatalf("synced migrated PR count = %d, want 1", prCount)
+	}
+	updatedIssue, err := testHandler.Queries.GetIssue(ctx, parseUUID(issue.ID))
+	if err != nil {
+		t.Fatalf("load synced legacy issue: %v", err)
+	}
+	if updatedIssue.Status != "in_progress" {
+		t.Fatalf("sync moved legacy issue to %q after preserved false intent, want in_progress", updatedIssue.Status)
 	}
 }
 

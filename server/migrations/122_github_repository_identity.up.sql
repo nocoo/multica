@@ -38,19 +38,19 @@ FROM (
 WHERE id <> canonical_id;
 
 -- Preserve every issue association while folding duplicate links. close_intent
--- is ORed because a valid historical closing declaration must not be lost.
+-- belongs to the PR snapshot that won survivor selection, not to every past
+-- variant: an earlier open/closed delivery can legitimately have a different
+-- declaration than the final merged delivery. Existing survivor links therefore
+-- win unchanged. If only a discarded variant had the link, keep the association
+-- but fail safe with false rather than guessing a closing declaration.
 WITH moved_links AS (
     SELECT DISTINCT ON (ipr.issue_id, merge.canonical_id)
         ipr.issue_id,
         merge.canonical_id AS pull_request_id,
         ipr.linked_by_type,
         ipr.linked_by_id,
-        BOOL_OR(ipr.close_intent) OVER (
-            PARTITION BY ipr.issue_id, merge.canonical_id
-        ) AS close_intent,
-        MIN(ipr.linked_at) OVER (
-            PARTITION BY ipr.issue_id, merge.canonical_id
-        ) AS linked_at
+        FALSE AS close_intent,
+        ipr.linked_at
     FROM issue_pull_request ipr
     JOIN github_pr_identity_merge merge ON merge.legacy_id = ipr.pull_request_id
     ORDER BY ipr.issue_id, merge.canonical_id, ipr.linked_at ASC, ipr.pull_request_id ASC
@@ -60,9 +60,7 @@ INSERT INTO issue_pull_request (
 )
 SELECT issue_id, pull_request_id, linked_by_type, linked_by_id, close_intent, linked_at
 FROM moved_links
-ON CONFLICT (issue_id, pull_request_id) DO UPDATE SET
-    close_intent = issue_pull_request.close_intent OR EXCLUDED.close_intent,
-    linked_at = LEAST(issue_pull_request.linked_at, EXCLUDED.linked_at);
+ON CONFLICT (issue_id, pull_request_id) DO NOTHING;
 
 DELETE FROM issue_pull_request ipr
 USING github_pr_identity_merge merge

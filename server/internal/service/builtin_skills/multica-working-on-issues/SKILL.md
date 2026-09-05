@@ -127,7 +127,10 @@ Repository owner/name identity is canonicalized to lower case for live
 `pull_request` and `check_suite` deliveries as well as sync. This avoids a
 different-cased `owner/repository` argument creating a second PR mirror.
 Migration `122_github_repository_identity` folds pre-existing case variants,
-their issue links, CI suites, and pending suites into that same identity.
+their issue links, CI suites, and pending suites into that same identity. A
+survivor's existing link keeps its `close_intent`; a link found only on a
+discarded variant is retained with `close_intent = false` because its final
+merge-time declaration cannot be proven.
 
 For a first historical observation of a terminal PR, sync derives close intent
 from the fetched title/body. If the PR was already **merged** locally and is

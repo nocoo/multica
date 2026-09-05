@@ -50,9 +50,10 @@ intent, while new links use the current snapshot (`github.go:1162-1191`). A
 
 Migration `server/migrations/122_github_repository_identity.up.sql` locks the
 four identity-bearing tables, picks one survivor per lower-cased PR key, merges
-issue links with `close_intent = OR`, moves the freshest CI suite, and rebuilds
-the pending-suite keys. The legacy-row migration followed by sync is exercised
-in `TestGitHubRepositoryIdentityMigration_ConsolidatesLegacyRowsForSync`
+issue links by preserving an existing survivor link and otherwise using
+`close_intent = false`, moves the freshest CI suite, and rebuilds the
+pending-suite keys. The legacy-row migration followed by sync is exercised in
+`TestGitHubRepositoryIdentityMigration_ConsolidatesLegacyRowsForSync`
 (`server/internal/handler/github_test.go`).
 
 ## PR response shape
